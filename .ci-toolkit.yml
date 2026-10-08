@@ -2,7 +2,14 @@ api_version: ci-toolkit/v1alpha1
 
 releases:
   uses: toolkit.release-please@v1
-  with:
-    version_file: version.txt
-    changelog_path: CHANGELOG.md
-    bump_minor_pre_major: true
+  tracks:
+    micro-h2:
+      version_file: version.txt
+      changelog_path: CHANGELOG.md
+      include_component_in_tag: false
+      bump_minor_pre_major: true
+      # The published 0.0.1 came from the old monorepo, outside this history.
+      # Anchor this repository's first proposal without fabricating v0.0.1.
+      bootstrap:
+        from_tag: repository-bootstrap
+        at_version: 0.0.1

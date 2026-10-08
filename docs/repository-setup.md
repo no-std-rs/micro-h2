@@ -61,6 +61,17 @@ versioning and changelog generation. `version.txt` starts at the already
 published `0.0.1`; never republish that version. A release PR bumps that file and
 CHANGELOG.md. Merging the PR makes Runnerless create its tag and GitHub Release.
 
+The first proposal uses the `micro-h2` track's one-time bootstrap anchor:
+`repository-bootstrap` points at the extraction commit
+`95c4e35478f0949a3eec2545dd056db2b119dc06`. It marks the start of this
+repository's history, not a crates.io release. The published `0.0.1` records
+monorepo commit `a36879123e11b53beda025dea5adedd1a075dc41` and contains different
+source, so creating `v0.0.1` here would misrepresent that release. Keep the
+bootstrap anchor fixed. It applies only while version.txt is `0.0.1` and no
+version tag exists; after the first release, a missing version tag is an error
+again. `include_component_in_tag: false` keeps release tags in the `v` namespace
+expected by the packaging workflow.
+
 The secret-free `publish-release.yml` workflow checks out that tag, aligns
 Cargo.toml and Cargo.lock with version.txt, tests and verifies the crate, captures
 Cargo's registry upload against a local loopback endpoint, and attaches the
@@ -72,11 +83,11 @@ Before activation:
 
 1. Install My Toolkit App `4602759` on this repository. The Runnerless bridge
    must list `no-std-rs/micro-h2` in RUNNERLESS_FORWARD_REPOSITORIES and
-   RELEASE_PROGRAM_REPOSITORIES, with a registry grant for only `micro-h2`.
-2. Connect the repository in Runnerless, add a crates.io publishing target for
-   `micro-h2` with tag prefix `v`, store its publishing token through the
-   write-only Package publishing form, and enable Production. A host fallback
-   grant uses binding REGISTRY_MICRO_H2_CRATES_TOKEN; credentials never go in Git.
+   RELEASE_PROGRAM_REPOSITORIES.
+2. Adopt the repository in Runnerless, add a crates publishing destination for
+   only `micro-h2` with tag prefix `v`, store its publishing token through the
+   write-only Production vault, and enable Production. Publishing resolves this
+   destination and credential through the app; credentials never go in Git.
 3. Deploy the reviewed bridge settings before merging this release migration.
    Keep release-plz disabled; its workflow is removed by the migration so only
    Runnerless can create releases.
