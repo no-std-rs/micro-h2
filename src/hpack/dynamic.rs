@@ -23,23 +23,12 @@
 use crate::Error;
 use crate::hpack::static_table::DYNAMIC_BASE;
 
-/// How many entries the table can hold.
-///
-/// The protocol bounds the table by *bytes*, not entries, so this is a second,
-/// independent cap. It exists because there is no allocator: `SETTINGS` can
-/// raise the byte budget beyond what a fixed array holds, and running out of
-/// slots must be a bounded eviction rather than a panic.
-/// A 256-byte advertised table can contain at most eight entries at HPACK's
-/// mandatory 32-byte per-entry overhead.
+/// Fixed number of entries. This represents every entry that fits the
+/// connection's advertised 256-byte table (32 bytes of overhead per entry).
 pub const MAX_ENTRIES: usize = 8;
 
-/// The longest header name or value the table will store.
-///
-/// A longer one is not an error — it simply is not remembered, exactly as if the
-/// encoder had sent it without indexing. Entries are only ever a compression
-/// hint, so forgetting one costs bytes and nothing else, while refusing the
-/// connection over a long cookie would cost the connection.
-pub const MAX_ENTRY_LEN: usize = 128;
+/// A single field can use all 256 advertised bytes minus entry overhead.
+pub const MAX_ENTRY_LEN: usize = 224;
 
 /// RFC 7541 section 4.1: an entry's size is its name plus its value plus 32
 /// bytes of assumed overhead. The constant is part of the wire protocol — both
@@ -64,6 +53,7 @@ pub struct DynamicTable {
     entries: heapless::Deque<Entry, MAX_ENTRIES>,
     size: usize,
     capacity: usize,
+    synchronized: bool,
 }
 
 impl DynamicTable {
@@ -72,6 +62,7 @@ impl DynamicTable {
             entries: heapless::Deque::new(),
             size: 0,
             capacity,
+            synchronized: true,
         }
     }
 
@@ -98,10 +89,20 @@ impl DynamicTable {
     pub fn set_capacity(&mut self, capacity: usize) {
         self.capacity = capacity;
         self.evict_to_fit(0);
+        if capacity == 0 {
+            self.synchronized = true;
+        }
+    }
+
+    pub(crate) fn synchronized(&self) -> bool {
+        self.synchronized
     }
 
     /// Look up a 1-based HPACK index, which for the dynamic table starts at 62.
     pub fn get(&self, index: usize) -> Option<(&str, &str)> {
+        if !self.synchronized {
+            return None;
+        }
         let offset = index.checked_sub(DYNAMIC_BASE)?;
         self.entries
             .iter()
@@ -109,24 +110,24 @@ impl DynamicTable {
             .map(|e| (e.name.as_str(), e.value.as_str()))
     }
 
-    /// Insert a header the peer marked for indexing.
-    ///
-    /// Never fails: an entry too large for the table evicts everything and is
-    /// then dropped, which is exactly what RFC 7541 section 4.4 requires.
+    /// Insert an indexed header, evicting only as required by the peer's byte
+    /// capacity. A capacity above our fixed storage is supported only while its
+    /// entries fit. Exceeding storage invalidates dynamic lookups until an
+    /// explicit table clear; silently evicting would shift the peer's indices.
     pub fn insert(&mut self, name: &str, value: &str) {
         let size = name.len() + value.len() + ENTRY_OVERHEAD;
         self.evict_to_fit(size);
-
-        if size > self.capacity || name.len() > MAX_ENTRY_LEN || value.len() > MAX_ENTRY_LEN {
+        if size > self.capacity {
+            self.synchronized = true;
             return;
         }
-        // The length cap above is ours rather than the protocol's, so an
-        // over-long header is simply not remembered. That is safe because an
-        // entry we decline is one we could never have resolved an index into
-        // anyway — and if the peer does index it, `lookup` fails loudly instead
-        // of returning the wrong header.
-        if self.entries.is_full() {
-            self.evict_oldest();
+        if !self.synchronized
+            || name.len() > MAX_ENTRY_LEN
+            || value.len() > MAX_ENTRY_LEN
+            || self.entries.is_full()
+        {
+            self.synchronized = false;
+            return;
         }
         let (Ok(name), Ok(value)) = (
             heapless::String::try_from(name),
@@ -244,9 +245,9 @@ mod tests {
     }
 
     #[test]
-    fn the_entry_count_cap_holds_even_when_the_byte_budget_would_allow_more() {
-        // The protocol bounds by bytes; with no allocator we also bound by
-        // slots, and running out must evict rather than panic.
+    fn entry_count_exhaustion_disables_dynamic_lookups() {
+        // Exceeding fixed storage must fail closed, without inventing peer
+        // evictions that change the meaning of a dynamic index.
         let mut table = DynamicTable::new(1_000_000);
         for i in 0..MAX_ENTRIES + 10 {
             let mut value = heapless::String::<8>::new();
@@ -254,5 +255,6 @@ mod tests {
             table.insert("k", &value);
         }
         assert_eq!(table.len(), MAX_ENTRIES);
+        assert_eq!(table.get(62), None);
     }
 }

@@ -47,9 +47,15 @@ The usual flow is:
 ## Deliberate limits
 
 This is not a general browser HTTP/2 stack. It has four concurrent streams, a
-4 KiB header-block buffer, no server mode, no push, no priority tree, no
+2 KiB header-block buffer, no server mode, no push, no priority tree, no
 trailers, and no outgoing CONTINUATION frames. Unsupported features are refused
 instead of partially implemented.
+
+Request bodies must fit one DATA frame and both available send windows.
+`Error::FlowControl` leaves the connection unchanged; process peer window updates
+or SETTINGS before retrying. New requests also respect MAX_CONCURRENT_STREAMS
+and stop after GOAWAY. Discard the connection after a receive-side protocol or
+HPACK error.
 
 TLS, TCP, retries, and request scheduling belong to the caller. This crate only
 turns HTTP/2 bytes into bounded state and events.

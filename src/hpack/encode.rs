@@ -46,6 +46,9 @@ pub fn encode_integer(
     out: &mut [u8],
     mut len: usize,
 ) -> Result<usize, Error> {
+    if !(1..=8).contains(&prefix_bits) {
+        return Err(Error::Hpack);
+    }
     let mask = (1u64 << prefix_bits) - 1;
 
     if value < mask {

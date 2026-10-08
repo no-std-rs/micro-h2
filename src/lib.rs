@@ -63,6 +63,9 @@ pub enum Error {
     StreamReset,
     /// More concurrent streams than this client supports.
     TooManyStreams,
+    /// The request body exceeds the peer's available flow-control credit.
+    /// Wait for WINDOW_UPDATE or a larger INITIAL_WINDOW_SIZE and retry.
+    FlowControl,
 }
 
 impl core::fmt::Display for Error {
@@ -76,6 +79,7 @@ impl core::fmt::Display for Error {
             Self::GoAway => "the server sent GOAWAY",
             Self::StreamReset => "the stream was reset",
             Self::TooManyStreams => "too many concurrent streams",
+            Self::FlowControl => "request exceeds available flow-control credit",
         })
     }
 }
