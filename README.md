@@ -76,8 +76,8 @@ them locally. CI checks both with the Rust 1.88 minimum supported version.
 ## Contributing and releases
 
 See [AGENTS.md](AGENTS.md) for validation and Conventional Commit PR titles,
-and [repository setup](docs/repository-setup.md) for release-plz and crates.io
-trusted publishing. The library and its interoperability tests were extracted
+and [repository setup](docs/repository-setup.md) for Runnerless release-please and crates.io
+publishing. The library and its interoperability tests were extracted
 from Tailfeather; [provenance](docs/provenance.md) records the source snapshot.
 
 ## License

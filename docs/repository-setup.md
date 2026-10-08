@@ -55,29 +55,42 @@ Runnerless review check when rerun.
 
 ## Automated releases
 
-The release workflow uses the same GitHub App and crates.io OIDC pattern as
-`oci-zero`. Both jobs stay disabled until `RELEASE_PLZ_ENABLED` is `true`, so
-the initial push does not fail for missing release credentials.
+Runnerless owns the release lifecycle. `.runnerless-ci.ts` declares
+`workflow().releasePlease()`; `.ci-toolkit.yml` configures Conventional Commit
+versioning and changelog generation. `version.txt` starts at the already
+published `0.0.1`; never republish that version. A release PR bumps that file and
+CHANGELOG.md. Merging the PR makes Runnerless create its tag and GitHub Release.
 
-1. Install the release-plz GitHub App on `no-std-rs/micro-h2`. Give it contents
-   and pull-request write access. Using the App lets release PRs trigger CI.
-2. Make `RELEASE_PLZ_APP_ID` and `RELEASE_PLZ_APP_PRIVATE_KEY` available as
-   repository secrets, or extend existing organization-secret access to this
-   repository. Keep private keys out of Git and command-line arguments.
-3. In the existing `micro-h2` crate's crates.io trusted-publishing settings,
-   configure owner `no-std-rs`, repository `micro-h2`, and workflow
-   `release-plz.yml`, with no environment. This repository uses the existing
-   crate name and starts with its `0.0.1` version; do not republish that version.
-4. Enable and run the workflow:
+The secret-free `publish-release.yml` workflow checks out that tag, aligns
+Cargo.toml and Cargo.lock with version.txt, tests and verifies the crate, captures
+Cargo's registry upload against a local loopback endpoint, and attaches the
+`.cargo-upload` body and SHA256SUMS to the GitHub Release. The successful
+workflow_run event asks Runnerless to verify and publish those assets to crates.io.
+GitHub Actions has no crates.io credential.
 
-   ```sh
-   gh variable set RELEASE_PLZ_ENABLED --repo no-std-rs/micro-h2 --body true
-   gh workflow run release-plz.yml --repo no-std-rs/micro-h2
-   ```
+Before activation:
 
-Release-plz compares against the published crate, opens a version/changelog PR
-when eligible changes require a release, and publishes the bumped version
-after that PR merges. CI validates packaging without publishing.
+1. Install My Toolkit App `4602759` on this repository. The Runnerless bridge
+   must list `no-std-rs/micro-h2` in RUNNERLESS_FORWARD_REPOSITORIES and
+   RELEASE_PROGRAM_REPOSITORIES, with a registry grant for only `micro-h2`.
+2. Connect the repository in Runnerless, add a crates.io publishing target for
+   `micro-h2` with tag prefix `v`, store its publishing token through the
+   write-only Package publishing form, and enable Production. A host fallback
+   grant uses binding REGISTRY_MICRO_H2_CRATES_TOKEN; credentials never go in Git.
+3. Deploy the reviewed bridge settings before merging this release migration.
+   Keep release-plz disabled; its workflow is removed by the migration so only
+   Runnerless can create releases.
+
+A push to main reconciles release state. After a release PR merges, monitor
+`Runnerless / Release`, the packaging workflow, and
+`Runnerless / crates-micro-h2`; then verify the new version on crates.io.
+To rebuild a published GitHub release whose packaging failed, dispatch
+publish-release.yml with its existing tag. Existing assets are not overwritten;
+inspect any attached partial output before a retry.
+
+The Codex review gate can be activated separately using
+`tools/enable-codex-gate.sh` after its current-head check is observed. It is not
+required to configure release-please.
 
 ## CI and updates
 
