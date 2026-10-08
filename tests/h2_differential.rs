@@ -17,12 +17,8 @@
 //! for 4 MB, which is 64 times the default window. Every test here runs under a
 //! timeout so that a flow-control bug fails as a failure rather than hanging CI.
 //!
-//! # Why not through ts2021
-//!
 //! `micro-h2` is sans-io, so it is driven straight over a `tokio::io::duplex`
-//! pipe. Layering it through the Noise record layer first would mean a failure
-//! here could be a record-framing bug, and the ts2021 stack is anchored
-//! separately by `pcap_replay` and `noise_vs_snow`.
+//! pipe without an external server or transport protocol.
 //!
 //! # What this file does *not* anchor
 //!

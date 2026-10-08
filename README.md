@@ -1,11 +1,31 @@
 # micro-h2
 
+[![CI](https://github.com/no-std-rs/micro-h2/actions/workflows/ci.yml/badge.svg)](https://github.com/no-std-rs/micro-h2/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/micro-h2.svg)](https://crates.io/crates/micro-h2)
+[![docs.rs](https://docs.rs/micro-h2/badge.svg)](https://docs.rs/micro-h2)
+
 A small, client-only HTTP/2 implementation for systems without `std` or an
 allocator.
 
-`micro-h2` exists to carry tailfeather's control-plane requests. It is sans-I/O:
-the caller moves bytes to and from a socket while `Connection` owns the HTTP/2
-and HPACK state.
+It is sans-I/O: the caller moves bytes to and from a socket while `Connection`
+owns the HTTP/2 and HPACK state. It requires Rust 1.88 and forbids unsafe Rust.
+The runtime dependency is `heapless`; HTTP/2 and HPACK reference implementations
+are used only in tests.
+
+```toml
+[dependencies]
+micro-h2 = "0.0.1"
+```
+
+```rust
+let mut connection = micro_h2::Connection::new();
+let mut out = [0u8; 256];
+let written = connection.start(&mut out).unwrap();
+// Send out[..written] through the transport you provide.
+```
+
+This is experimental protocol software; the supported HTTP/2 surface is
+deliberately limited as described below.
 
 ## What it handles
 
@@ -37,11 +57,28 @@ turns HTTP/2 bytes into bounded state and events.
 ## Verification
 
 Unit tests cover framing, HPACK state, Huffman decoding, and flow control.
-Differential tests in `ts-conformance` exchange traffic with the Rust `h2`
-implementation and compare HPACK in both directions with `fluke-hpack`.
+Differential tests in `tests/` exchange traffic with the Rust `h2`
+implementation, including a 4 MiB response that exercises flow-control updates,
+and compare HPACK in both directions with `fluke-hpack`. The tests use in-memory
+transports and require no external service.
 
-See the [repository README](https://github.com/pawelchcki/tailfeather) for where
-this crate sits in the full stack.
+```sh
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo check --locked --lib --no-default-features --target riscv32imac-unknown-none-elf
+cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
+```
+
+Install the cross-compilation targets with `rustup target add` before checking
+them locally. CI checks both with the Rust 1.88 minimum supported version.
+
+## Contributing and releases
+
+See [AGENTS.md](AGENTS.md) for validation and Conventional Commit PR titles,
+and [repository setup](docs/repository-setup.md) for release-plz and crates.io
+trusted publishing. The library and its interoperability tests were extracted
+from Tailfeather; [provenance](docs/provenance.md) records the source snapshot.
 
 ## License
 
