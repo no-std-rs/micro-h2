@@ -42,6 +42,12 @@ gh api --method PATCH "repos/$repo" \
 
 protection_file=$(mktemp)
 trap 'rm -f "$protection_file"' EXIT
+retain_codex_gate=false
+if gh api "repos/$repo/branches/main/protection/required_status_checks" \
+  --jq 'any(.checks[]; .context == "Runnerless / Codex review" and .app_id == 4602759)' \
+  2>/dev/null | grep -qx true; then
+  retain_codex_gate=true
+fi
 cat > "$protection_file" <<'JSON'
 {
   "required_status_checks": {
@@ -60,6 +66,13 @@ cat > "$protection_file" <<'JSON'
   "allow_deletions": false
 }
 JSON
+if [ "$retain_codex_gate" = true ]; then
+  command -v jq >/dev/null
+  protection_json=$(jq \
+    '.required_status_checks.checks = ([.required_status_checks.contexts[] | {context: ., app_id: -1}] + [{context: "Runnerless / Codex review", app_id: 4602759}]) | del(.required_status_checks.contexts)' \
+    "$protection_file")
+  printf '%s\n' "$protection_json" > "$protection_file"
+fi
 gh api --method PUT "repos/$repo/branches/main/protection" \
   --input "$protection_file" > /dev/null
 

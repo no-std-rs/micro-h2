@@ -20,6 +20,39 @@ existing private repository and never force-pushes. It allows administrator
 bypass and requires no second approver, so a solo maintainer can operate it.
 GitHub Actions must be allowed by the organization policy.
 
+## Codex review through Runnerless
+
+`.runnerless-ci.ts` evaluates trusted Codex evidence and reports
+`Runnerless / Codex review`. The check passes only when the shared evaluator
+accepts the current head, including resolved review threads and no newer
+unanswered review request. The evaluator retains its maintainer-authorized
+`codex: bypass-review` escape hatch.
+
+Activation requires these settings:
+
+1. Give My Toolkit (GitHub App `4602759`) and the Codex connector access to
+   this repository. Enable automatic code review for `no-std-rs/micro-h2` in
+   [Codex review settings](https://chatgpt.com/codex/settings/code-review), or
+   request `@codex review` on each new head. The `codex: auto-review` PR label
+   also lets the shared tracker request a review when evidence is missing.
+2. Deploy the scoped bridge configuration from `pawelchcki/my-infra`: add
+   this repository to `ALLOWED_REPOSITORIES` for review evidence tracking and
+   to `RUNNERLESS_FORWARD_REPOSITORIES` for program execution. Keep the
+   account-wide allowlist and legacy enforcement canaries unchanged.
+3. After the program is on `main`, open a PR and confirm Runnerless reports
+   its review check. Pin that check to its App while preserving existing CI
+   requirements:
+
+   ```sh
+   bash tools/enable-codex-gate.sh PR_NUMBER
+   ```
+
+The activation script refuses to require an unseen check. The gate is active
+only after this branch-protection update; committing the program alone does
+not enforce merges. Administrator bypass remains as configured by the initial
+repository setup. `tools/setup-github.sh` retains an already-required
+Runnerless review check when rerun.
+
 ## Automated releases
 
 The release workflow uses the same GitHub App and crates.io OIDC pattern as

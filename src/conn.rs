@@ -402,7 +402,7 @@ impl Connection {
         if !payload.len().is_multiple_of(6) {
             return Err(Error::Protocol);
         }
-        for entry in payload.chunks_exact(6) {
+        for entry in payload.as_chunks::<6>().0 {
             let identifier = u16::from_be_bytes([entry[0], entry[1]]);
             let value = u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
             match identifier {
