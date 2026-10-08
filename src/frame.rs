@@ -117,6 +117,9 @@ impl FrameHeader {
     }
 
     pub fn write(&self, out: &mut [u8]) -> Result<usize, Error> {
+        if self.length > 0x00ff_ffff {
+            return Err(Error::FrameTooLarge);
+        }
         let out = out.get_mut(..HEADER_LEN).ok_or(Error::BufferTooSmall)?;
         let length = (self.length as u32).to_be_bytes();
         out[0..3].copy_from_slice(&length[1..4]);
@@ -230,6 +233,19 @@ mod tests {
         assert_eq!(
             strip_padding(&[0x09, b'h'], flags::PADDED),
             Err(Error::Protocol)
+        );
+    }
+    #[test]
+    fn writing_a_length_that_exceeds_the_wire_field_fails() {
+        let header = FrameHeader {
+            length: 1 << 24,
+            kind: FrameType::Data,
+            flags: 0,
+            stream: 1,
+        };
+        assert_eq!(
+            header.write(&mut [0u8; HEADER_LEN]),
+            Err(Error::FrameTooLarge)
         );
     }
 }

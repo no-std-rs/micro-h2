@@ -53,6 +53,7 @@ struct Stream {
     /// Bytes received since the last `WINDOW_UPDATE` for this stream.
     consumed: u32,
     open: bool,
+    send_window: i64,
 }
 
 /// What arrived.
@@ -89,6 +90,10 @@ pub struct Connection {
     consumed: u32,
     /// What the peer said it will accept in one frame.
     peer_max_frame: usize,
+    send_window: u32,
+    peer_initial_window: u32,
+    peer_max_streams: u32,
+    goaway: bool,
 }
 
 impl Default for Connection {
@@ -109,6 +114,10 @@ impl Connection {
             header_end_stream: false,
             consumed: 0,
             peer_max_frame: frame::DEFAULT_MAX_FRAME,
+            send_window: DEFAULT_WINDOW,
+            peer_initial_window: DEFAULT_WINDOW,
+            peer_max_streams: u32::MAX,
+            goaway: false,
         }
     }
 
@@ -163,15 +172,16 @@ impl Connection {
         body: &[u8],
         out: &mut [u8],
     ) -> Result<(u32, usize), Error> {
+        if self.goaway {
+            return Err(Error::GoAway);
+        }
         let id = self.next_stream;
-        self.streams
-            .push(Stream {
-                id,
-                consumed: 0,
-                open: true,
-            })
-            .map_err(|_| Error::TooManyStreams)?;
-        self.next_stream += 2;
+        if self.streams.len() as u32 >= self.peer_max_streams {
+            return Err(Error::TooManyStreams);
+        }
+        if self.streams.is_full() || id > 0x7fff_ffff {
+            return Err(Error::TooManyStreams);
+        }
 
         // Pseudo-headers must come first and in this order; a server is entitled
         // to reject a block that interleaves them with ordinary fields.
@@ -191,6 +201,24 @@ impl Connection {
             return Err(Error::FrameTooLarge);
         }
 
+        if body.len() > self.peer_max_frame {
+            return Err(Error::FrameTooLarge);
+        }
+        if body.len() > self.send_window as usize || body.len() > self.peer_initial_window as usize
+        {
+            return Err(Error::FlowControl);
+        }
+        let required = frame::HEADER_LEN
+            + block_len
+            + if body.is_empty() {
+                0
+            } else {
+                frame::HEADER_LEN + body.len()
+            };
+        if out.len() < required {
+            return Err(Error::BufferTooSmall);
+        }
+
         let end_stream = if body.is_empty() {
             flags::END_STREAM
         } else {
@@ -205,9 +233,6 @@ impl Connection {
         )?;
 
         if !body.is_empty() {
-            if body.len() > self.peer_max_frame {
-                return Err(Error::FrameTooLarge);
-            }
             len += frame::write_frame(
                 FrameType::Data,
                 flags::END_STREAM,
@@ -216,6 +241,16 @@ impl Connection {
                 &mut out[len..],
             )?;
         }
+        self.streams
+            .push(Stream {
+                id,
+                consumed: 0,
+                open: true,
+                send_window: self.peer_initial_window as i64 - body.len() as i64,
+            })
+            .map_err(|_| Error::TooManyStreams)?;
+        self.next_stream += 2;
+        self.send_window -= body.len() as u32;
         Ok((id, len))
     }
 
@@ -234,6 +269,46 @@ impl Connection {
         let payload = bytes
             .get(frame::HEADER_LEN..frame::HEADER_LEN + header.length)
             .ok_or(Error::Incomplete)?;
+        if header.length > frame::DEFAULT_MAX_FRAME {
+            return Err(Error::FrameTooLarge);
+        }
+        if self.header_stream != 0 {
+            if header.kind != FrameType::Continuation || header.stream != self.header_stream {
+                return Err(Error::Protocol);
+            }
+        } else if header.kind == FrameType::Continuation {
+            return Err(Error::Protocol);
+        }
+        match header.kind {
+            FrameType::Settings
+                if header.stream != 0 || (header.has(flags::ACK) && !payload.is_empty()) =>
+            {
+                return Err(Error::Protocol);
+            }
+            FrameType::Ping if header.stream != 0 || payload.len() != 8 => {
+                return Err(Error::Protocol);
+            }
+            FrameType::GoAway if header.stream != 0 || payload.len() < 8 => {
+                return Err(Error::Protocol);
+            }
+            FrameType::Headers | FrameType::Data | FrameType::Continuation
+                if header.stream == 0 =>
+            {
+                return Err(Error::Protocol);
+            }
+            FrameType::RstStream if header.stream == 0 || payload.len() != 4 => {
+                return Err(Error::Protocol);
+            }
+            FrameType::Priority if header.stream == 0 || payload.len() != 5 => {
+                return Err(Error::Protocol);
+            }
+            FrameType::WindowUpdate
+                if payload.len() != 4 || read_u32(payload).unwrap() & 0x7fff_ffff == 0 =>
+            {
+                return Err(Error::Protocol);
+            }
+            _ => {}
+        }
         let mut written = 0;
 
         match header.kind {
@@ -284,6 +359,8 @@ impl Connection {
                 let stream = self.header_stream;
                 let end_stream = self.header_end_stream;
                 self.decoder.decode(&self.header_block, &mut on_header)?;
+                self.header_stream = 0;
+                self.header_block.clear();
                 if end_stream {
                     self.close(stream);
                 }
@@ -327,14 +404,29 @@ impl Connection {
                     .get(4..8)
                     .and_then(read_u32)
                     .ok_or(Error::Protocol)?;
+                self.goaway = true;
                 Ok((Event::GoAway { code }, 0))
             }
 
-            // Window updates from the peer govern what *we* may send. Our
-            // requests are a few kilobytes against a 65535-byte default, so
-            // there is nothing to track; a client that streamed large bodies
-            // would have to.
-            FrameType::WindowUpdate | FrameType::Priority => Ok((Event::Nothing, 0)),
+            FrameType::WindowUpdate => {
+                let increment = read_u32(payload).ok_or(Error::Protocol)? & 0x7fff_ffff;
+                if header.stream == 0 {
+                    self.send_window = self
+                        .send_window
+                        .checked_add(increment)
+                        .filter(|value| *value <= 0x7fff_ffff)
+                        .ok_or(Error::Protocol)?;
+                } else if let Some(stream) = self.streams.iter_mut().find(|s| s.id == header.stream)
+                {
+                    let window = stream.send_window + increment as i64;
+                    if window > 0x7fff_ffff {
+                        return Err(Error::Protocol);
+                    }
+                    stream.send_window = window;
+                }
+                Ok((Event::Nothing, 0))
+            }
+            FrameType::Priority => Ok((Event::Nothing, 0)),
 
             // Push was refused in our SETTINGS, so a promise is a protocol
             // violation rather than something to ignore.
@@ -353,8 +445,11 @@ impl Connection {
     /// and stream closure still happen exactly once, after every payload byte
     /// (including padding) has been authenticated and consumed.
     pub fn finish_data(&mut self, header: FrameHeader, out: &mut [u8]) -> Result<usize, Error> {
-        if header.kind != FrameType::Data {
+        if header.kind != FrameType::Data || header.stream == 0 || self.header_stream != 0 {
             return Err(Error::Protocol);
+        }
+        if header.length > frame::DEFAULT_MAX_FRAME {
+            return Err(Error::FrameTooLarge);
         }
         let written = self.credit(header.stream, header.length as u32, out)?;
         if header.has(flags::END_STREAM) {
@@ -368,32 +463,42 @@ impl Connection {
         if length == 0 {
             return Ok(0);
         }
-        let mut written = 0;
-
-        // Topping up only past a threshold keeps a stream of small DATA frames
-        // from producing one update each.
         const THRESHOLD: u32 = RECEIVE_WINDOW / 2;
-
-        self.consumed += length;
-        if self.consumed >= THRESHOLD {
-            let increment = self.consumed.to_be_bytes();
-            written += frame::write_frame(FrameType::WindowUpdate, 0, 0, &increment, out)?;
-            self.consumed = 0;
+        let consumed = self.consumed.checked_add(length).ok_or(Error::Protocol)?;
+        let stream_consumed = self
+            .streams
+            .iter()
+            .find(|s| s.id == stream)
+            .map(|entry| entry.consumed.checked_add(length).ok_or(Error::Protocol))
+            .transpose()?;
+        let connection_update = consumed >= THRESHOLD;
+        let stream_update = stream_consumed.is_some_and(|value| value >= THRESHOLD);
+        let required =
+            (connection_update as usize + stream_update as usize) * (frame::HEADER_LEN + 4);
+        if out.len() < required {
+            return Err(Error::BufferTooSmall);
         }
-
+        let mut written = 0;
+        if connection_update {
+            written +=
+                frame::write_frame(FrameType::WindowUpdate, 0, 0, &consumed.to_be_bytes(), out)?;
+        }
+        if stream_update {
+            written += frame::write_frame(
+                FrameType::WindowUpdate,
+                0,
+                stream,
+                &stream_consumed.unwrap().to_be_bytes(),
+                &mut out[written..],
+            )?;
+        }
+        self.consumed = if connection_update { 0 } else { consumed };
         if let Some(entry) = self.streams.iter_mut().find(|s| s.id == stream) {
-            entry.consumed += length;
-            if entry.consumed >= THRESHOLD {
-                let increment = entry.consumed.to_be_bytes();
-                written += frame::write_frame(
-                    FrameType::WindowUpdate,
-                    0,
-                    stream,
-                    &increment,
-                    &mut out[written..],
-                )?;
-                entry.consumed = 0;
-            }
+            entry.consumed = if stream_update {
+                0
+            } else {
+                stream_consumed.unwrap()
+            };
         }
         Ok(written)
     }
@@ -406,13 +511,36 @@ impl Connection {
             let identifier = u16::from_be_bytes([entry[0], entry[1]]);
             let value = u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
             match identifier {
-                settings::MAX_FRAME_SIZE => self.peer_max_frame = value as usize,
+                settings::MAX_FRAME_SIZE => {
+                    if !(16_384..=16_777_215).contains(&value) {
+                        return Err(Error::Protocol);
+                    }
+                    self.peer_max_frame = value as usize;
+                }
+                settings::INITIAL_WINDOW_SIZE => {
+                    if value > 0x7fff_ffff {
+                        return Err(Error::Protocol);
+                    }
+                    let delta = value as i64 - self.peer_initial_window as i64;
+                    if self
+                        .streams
+                        .iter()
+                        .any(|stream| stream.send_window + delta > 0x7fff_ffff)
+                    {
+                        return Err(Error::Protocol);
+                    }
+                    for stream in &mut self.streams {
+                        stream.send_window += delta;
+                    }
+                    self.peer_initial_window = value;
+                }
+                settings::MAX_CONCURRENT_STREAMS => self.peer_max_streams = value,
+                settings::ENABLE_PUSH => return Err(Error::Protocol),
                 // This limits our encoder, which deliberately has no dynamic
                 // table. The receive decoder is governed by the 256-byte limit
                 // we advertised and must retain its connection-wide state.
                 settings::HEADER_TABLE_SIZE => {}
-                // Everything else governs what we may send, and our requests are
-                // too small for any of it to bind.
+                // Unknown settings are ignored as required by HTTP/2.
                 _ => {}
             }
         }
@@ -717,5 +845,153 @@ mod tests {
         let (event, written) = connection.recv(&unknown, |_, _| {}, &mut out).unwrap();
         assert_eq!(event, Event::Nothing);
         assert_eq!(written, 0);
+    }
+    #[test]
+    fn failed_requests_do_not_consume_stream_slots_or_identifiers() {
+        let mut connection = Connection::new();
+        for _ in 0..MAX_STREAMS + 1 {
+            assert_eq!(
+                connection.request("GET", "/", "h", "https", &[], b"", &mut []),
+                Err(Error::BufferTooSmall)
+            );
+            assert_eq!(connection.open_streams(), 0);
+        }
+        let mut out = [0u8; 128];
+        assert_eq!(
+            connection
+                .request("GET", "/", "h", "https", &[], b"", &mut out)
+                .unwrap()
+                .0,
+            1
+        );
+    }
+
+    #[test]
+    fn continuation_must_follow_headers_on_the_same_stream() {
+        for (kind, stream) in [
+            (FrameType::Continuation, 3),
+            (FrameType::Ping, 0),
+            (FrameType::Headers, 3),
+        ] {
+            let mut connection = Connection::new();
+            let mut out = [0u8; 128];
+            let first = frame_bytes(FrameType::Headers, 0, 1, &[0x88]);
+            connection.recv(&first, |_, _| {}, &mut out).unwrap();
+            let next = frame_bytes(kind, flags::END_HEADERS, stream, &[0x82]);
+            assert_eq!(
+                connection.recv(&next, |_, _| {}, &mut out).err(),
+                Some(Error::Protocol)
+            );
+        }
+        let mut connection = Connection::new();
+        let orphan = frame_bytes(FrameType::Continuation, flags::END_HEADERS, 1, &[0x88]);
+        assert_eq!(
+            connection.recv(&orphan, |_, _| {}, &mut [0u8; 128]).err(),
+            Some(Error::Protocol)
+        );
+    }
+    #[test]
+    fn request_body_waits_for_connection_and_stream_credit() {
+        let mut connection = Connection::new();
+        let mut out = [0u8; 256];
+        let zero = frame_bytes(FrameType::Settings, 0, 0, &[0, 4, 0, 0, 0, 0]);
+        connection.recv(&zero, |_, _| {}, &mut out).unwrap();
+        assert_eq!(
+            connection.request("POST", "/", "h", "https", &[], b"a", &mut out),
+            Err(Error::FlowControl)
+        );
+        assert_eq!(connection.open_streams(), 0);
+        let one = frame_bytes(FrameType::Settings, 0, 0, &[0, 4, 0, 0, 0, 1]);
+        connection.recv(&one, |_, _| {}, &mut out).unwrap();
+        connection.send_window = 0;
+        assert_eq!(
+            connection.request("POST", "/", "h", "https", &[], b"a", &mut out),
+            Err(Error::FlowControl)
+        );
+        let update = frame_bytes(FrameType::WindowUpdate, 0, 0, &[0, 0, 0, 1]);
+        connection.recv(&update, |_, _| {}, &mut out).unwrap();
+        assert_eq!(
+            connection
+                .request("POST", "/", "h", "https", &[], b"a", &mut out)
+                .unwrap()
+                .0,
+            1
+        );
+        assert_eq!(connection.send_window, 0);
+    }
+
+    #[test]
+    fn exhausted_connection_credit_blocks_later_small_requests() {
+        let mut connection = Connection::new();
+        let mut out = [0u8; 17_000];
+        for _ in 0..4 {
+            let (id, _) = connection
+                .request("POST", "/", "h", "https", &[], &[0; 16_000], &mut out)
+                .unwrap();
+            connection.close(id);
+        }
+        assert_eq!(
+            connection.request("POST", "/", "h", "https", &[], &[0; 2_000], &mut out),
+            Err(Error::FlowControl)
+        );
+    }
+
+    #[test]
+    fn failed_credit_output_can_be_retried_without_double_counting() {
+        let mut connection = Connection::new();
+        let mut out = [0u8; 128];
+        let (id, _) = connection
+            .request("GET", "/", "h", "https", &[], b"", &mut out)
+            .unwrap();
+        connection.consumed = RECEIVE_WINDOW / 2 - 1;
+        connection.streams[0].consumed = RECEIVE_WINDOW / 2 - 1;
+        let data = frame_bytes(FrameType::Data, 0, id, b"a");
+        assert_eq!(
+            connection.recv(&data, |_, _| {}, &mut out[..13]).err(),
+            Some(Error::BufferTooSmall)
+        );
+        assert_eq!(connection.consumed, RECEIVE_WINDOW / 2 - 1);
+        let (_, written) = connection.recv(&data, |_, _| {}, &mut out).unwrap();
+        assert_eq!(written, 26);
+        assert_eq!(read_u32(&out[9..13]), Some(RECEIVE_WINDOW / 2));
+        assert_eq!(read_u32(&out[22..26]), Some(RECEIVE_WINDOW / 2));
+    }
+
+    #[test]
+    fn settings_stream_limits_and_goaway_stop_new_requests() {
+        let mut connection = Connection::new();
+        let mut out = [0u8; 128];
+        let zero = frame_bytes(FrameType::Settings, 0, 0, &[0, 3, 0, 0, 0, 0]);
+        connection.recv(&zero, |_, _| {}, &mut out).unwrap();
+        assert_eq!(
+            connection.request("GET", "/", "h", "https", &[], b"", &mut out),
+            Err(Error::TooManyStreams)
+        );
+        let goaway = frame_bytes(FrameType::GoAway, 0, 0, &[0; 8]);
+        connection.recv(&goaway, |_, _| {}, &mut out).unwrap();
+        assert_eq!(
+            connection.request("GET", "/", "h", "https", &[], b"", &mut out),
+            Err(Error::GoAway)
+        );
+    }
+
+    #[test]
+    fn malformed_control_frames_are_rejected() {
+        for (kind, flags, stream, payload) in [
+            (FrameType::Settings, flags::ACK, 0, &[0u8; 6][..]),
+            (FrameType::Settings, 0, 1, &[][..]),
+            (FrameType::Ping, 0, 0, &[0; 7][..]),
+            (FrameType::RstStream, 0, 0, &[0; 4][..]),
+            (FrameType::WindowUpdate, 0, 0, &[0; 4][..]),
+            (FrameType::Headers, flags::END_HEADERS, 0, &[0x88][..]),
+        ] {
+            let bytes = frame_bytes(kind, flags, stream, payload);
+            assert_eq!(
+                Connection::new()
+                    .recv(&bytes, |_, _| {}, &mut [0u8; 128])
+                    .err(),
+                Some(Error::Protocol)
+            );
+        }
     }
 }

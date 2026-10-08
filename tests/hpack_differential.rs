@@ -386,3 +386,55 @@ fn both_directions_agree_on_every_case() {
         assert_eq!(our_decode(&mut ours, &reencoded), expected, "case {i}");
     }
 }
+
+/// Repeated *indexed* long values, with an older entry present when it fits.
+/// The old 128-byte storage limit either substituted that older header or lost
+/// the index entirely. Independent encoders/decoders must agree across blocks.
+#[test]
+fn indexed_long_values_round_trip_in_parallel_without_shifting_old_entries() {
+    std::thread::scope(|scope| {
+        for length in [128, 129, 159, 185, 186, 200, 223] {
+            scope.spawn(move || {
+                let value = "z".repeat(length);
+                let mut encoder = TheirEncoder::new();
+                encoder.set_max_table_size(DEFAULT_TABLE_SIZE);
+                let mut theirs = TheirDecoder::new();
+                theirs.set_max_table_size(DEFAULT_TABLE_SIZE);
+                let mut ours = Decoder::new(DEFAULT_TABLE_SIZE);
+
+                let older = encoder.encode([(b"a".as_slice(), b"old".as_slice())]);
+                assert_eq!(
+                    our_decode(&mut ours, &older),
+                    their_decode(&mut theirs, &older)
+                );
+
+                let literal = encoder.encode([(b"b".as_slice(), value.as_bytes())]);
+                assert_eq!(
+                    literal[0] & 0xc0,
+                    0x40,
+                    "reference encoder did not index the long value"
+                );
+                assert_eq!(
+                    our_decode(&mut ours, &literal),
+                    their_decode(&mut theirs, &literal)
+                );
+                let indexed = encoder.encode([(b"b".as_slice(), value.as_bytes())]);
+                assert_eq!(indexed, [0xbe], "reference encoder did not reuse index 62");
+                for _ in 0..32 {
+                    let expected = their_decode(&mut theirs, &indexed);
+                    let decoded = our_decode(&mut ours, &indexed);
+                    assert_eq!(
+                        decoded, expected,
+                        "value length {length}: dynamic index shifted"
+                    );
+                    assert_eq!(decoded, [("b".to_owned(), value.clone())]);
+                    let borrowed: Vec<_> = decoded
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str()))
+                        .collect();
+                    assert_eq!(their_decode(&mut theirs, &our_encode(&borrowed)), expected);
+                }
+            });
+        }
+    });
+}

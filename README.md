@@ -47,9 +47,15 @@ The usual flow is:
 ## Deliberate limits
 
 This is not a general browser HTTP/2 stack. It has four concurrent streams, a
-4 KiB header-block buffer, no server mode, no push, no priority tree, no
+2 KiB header-block buffer, no server mode, no push, no priority tree, no
 trailers, and no outgoing CONTINUATION frames. Unsupported features are refused
 instead of partially implemented.
+
+Request bodies must fit one DATA frame and both available send windows.
+`Error::FlowControl` leaves the connection unchanged; process peer window updates
+or SETTINGS before retrying. New requests also respect MAX_CONCURRENT_STREAMS
+and stop after GOAWAY. Discard the connection after a receive-side protocol or
+HPACK error.
 
 TLS, TCP, retries, and request scheduling belong to the caller. This crate only
 turns HTTP/2 bytes into bounded state and events.
@@ -59,8 +65,12 @@ turns HTTP/2 bytes into bounded state and events.
 Unit tests cover framing, HPACK state, Huffman decoding, and flow control.
 Differential tests in `tests/` exchange traffic with the Rust `h2`
 implementation, including a 4 MiB response that exercises flow-control updates,
-and compare HPACK in both directions with `fluke-hpack`. The tests use in-memory
-transports and require no external service.
+and compare HPACK in both directions with `fluke-hpack`. Protocol regressions
+fill all four stream slots on eight independent connections: a barrier ensures
+32 simultaneous streams, with 64 round trips across two waves. Each response
+exceeds the receive window; tests verify exact headers and echoed bytes,
+credit-buffer retries, negotiated limits, and valid and malformed continuation
+sequences. The tests use in-memory transports and require no external service.
 
 ```sh
 cargo fmt --all --check

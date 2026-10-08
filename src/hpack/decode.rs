@@ -64,6 +64,7 @@ impl Decoder {
         mut input: &[u8],
         mut on_header: impl FnMut(&str, &str),
     ) -> Result<(), Error> {
+        let mut saw_header = false;
         while !input.is_empty() {
             let first = input[0];
 
@@ -71,21 +72,27 @@ impl Decoder {
                 // Indexed: name and value both come from a table.
                 let (index, rest) = decode_integer(input, 7)?;
                 input = rest;
-                let (name, value) = lookup(&self.table, index as usize)?;
+                let (name, value) = lookup(
+                    &self.table,
+                    usize::try_from(index).map_err(|_| Error::Hpack)?,
+                )?;
                 on_header(name, value);
+                saw_header = true;
                 continue;
             }
 
             if first & 0xe0 == 0x20 {
-                // Dynamic table size update. Not a header, and legal only at the
-                // start of a block, but accepting it anywhere costs nothing and
-                // rejecting a legal stream costs the connection.
+                // Size updates may only precede all header fields.
+                if saw_header {
+                    return Err(Error::Hpack);
+                }
                 let (size, rest) = decode_integer(input, 5)?;
                 input = rest;
-                if size as usize > self.max_capacity {
+                let size = usize::try_from(size).map_err(|_| Error::Hpack)?;
+                if size > self.max_capacity {
                     return Err(Error::Protocol);
                 }
-                self.table.set_capacity(size as usize);
+                self.table.set_capacity(size);
                 continue;
             }
 
@@ -106,17 +113,24 @@ impl Decoder {
             if index == 0 {
                 input = decode_string(input, &mut name)?;
             } else {
-                let (existing, _) = lookup(&self.table, index as usize)?;
+                let (existing, _) = lookup(
+                    &self.table,
+                    usize::try_from(index).map_err(|_| Error::Hpack)?,
+                )?;
                 name.push_str(existing).map_err(|_| Error::BufferTooSmall)?;
             }
 
             let mut value = heapless::String::<MAX_STRING>::new();
             input = decode_string(input, &mut value)?;
 
-            on_header(&name, &value);
             if indexing {
                 self.table.insert(&name, &value);
+                if !self.table.synchronized() {
+                    return Err(Error::BufferTooSmall);
+                }
             }
+            on_header(&name, &value);
+            saw_header = true;
         }
         Ok(())
     }
@@ -127,6 +141,9 @@ impl Decoder {
 ///
 /// Returns the value and the remaining input.
 pub fn decode_integer(input: &[u8], prefix_bits: u32) -> Result<(u64, &[u8]), Error> {
+    if !(1..=8).contains(&prefix_bits) {
+        return Err(Error::Hpack);
+    }
     let mask = (1u64 << prefix_bits) - 1;
     let first = *input.first().ok_or(Error::Incomplete)? as u64;
     let value = first & mask;
@@ -142,7 +159,7 @@ pub fn decode_integer(input: &[u8], prefix_bits: u32) -> Result<(u64, &[u8]), Er
         rest = &rest[1..];
         // Bounded so a hostile encoder cannot spin here, and so the shift cannot
         // overflow — 64 bits is ten seven-bit groups.
-        if shift > 63 {
+        if shift > 63 || (shift == 63 && byte & 0x7f > 1) {
             return Err(Error::Hpack);
         }
         value = value
@@ -162,7 +179,7 @@ fn decode_string<'a>(
 ) -> Result<&'a [u8], Error> {
     let huffman_coded = input.first().ok_or(Error::Incomplete)? & 0x80 != 0;
     let (len, rest) = decode_integer(input, 7)?;
-    let len = len as usize;
+    let len = usize::try_from(len).map_err(|_| Error::Hpack)?;
     let bytes = rest.get(..len).ok_or(Error::Incomplete)?;
 
     let mut buffer = [0u8; MAX_STRING];
@@ -353,6 +370,56 @@ mod tests {
         assert!(
             decoder.table().is_empty(),
             "a never-indexed header must not be remembered"
+        );
+    }
+    #[test]
+    fn indexed_long_values_do_not_shift_the_dynamic_table() {
+        let mut decoder = Decoder::new(256);
+        decoder
+            .decode(&[0x40, 1, b'x', 1, b'y'], |_, _| {})
+            .unwrap();
+        let mut block = heapless::Vec::<u8, 256>::new();
+        block.extend_from_slice(&[0x40, 1, b'a', 0x7f, 2]).unwrap();
+        block.extend_from_slice(&[b'z'; 129]).unwrap();
+        decoder.decode(&block, |_, _| {}).unwrap();
+        let mut seen = false;
+        decoder
+            .decode(&[0xbe], |name, value| {
+                assert_eq!(name, "a");
+                assert_eq!(value.len(), 129);
+                seen = true;
+            })
+            .unwrap();
+        assert!(seen);
+    }
+
+    #[test]
+    fn overflowing_integer_is_rejected_instead_of_wrapping() {
+        let bytes = [
+            0xff, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02,
+        ];
+        assert_eq!(decode_integer(&bytes, 7), Err(Error::Hpack));
+    }
+    #[test]
+    fn table_storage_exhaustion_fails_before_an_index_can_be_misread() {
+        let mut decoder = Decoder::new(4096);
+        for _ in 0..8 {
+            decoder
+                .decode(&[0x40, 1, b'x', 1, b'y'], |_, _| {})
+                .unwrap();
+        }
+        assert_eq!(
+            decoder.decode(&[0x40, 1, b'a', 1, b'b'], |_, _| {}),
+            Err(Error::BufferTooSmall)
+        );
+        assert_eq!(decoder.decode(&[0xbe], |_, _| {}), Err(Error::Hpack));
+    }
+
+    #[test]
+    fn table_updates_after_headers_are_rejected() {
+        assert_eq!(
+            Decoder::new(256).decode(&[0x88, 0x20], |_, _| {}),
+            Err(Error::Hpack)
         );
     }
 }
