@@ -21,9 +21,13 @@ subject, for example `fix(micro-h2): reject an invalid stream identifier`.
 
 Use `feat`, `fix`, or `perf` for changes that should trigger a release;
 `refactor`, `docs`, `test`, `ci`, `build`, and `chore` do not trigger one.
-Add `!` or a `BREAKING CHANGE:` footer for breaking changes. This policy is
-enforced by `.release-plz.toml` and the PR-title workflow.
+Add `!` or a `BREAKING CHANGE:` footer for breaking changes. The Runnerless
+release-please policy uses these commit types.
 
-Once configured, release-plz opens version/changelog PRs, then publishes after
-they merge using crates.io trusted publishing. Do not run `cargo publish` by
-hand. See `docs/repository-setup.md` for required GitHub App and crates.io setup.
+Runnerless opens version/changelog PRs from `.ci-toolkit.yml` and
+`.runnerless-ci.ts`, then tags merged release PRs. `version.txt` is the release
+version; the packaging workflow aligns Cargo.toml and Cargo.lock with it.
+GitHub Actions captures a Cargo upload against a local registry and attaches it
+to the GitHub Release. Runnerless alone publishes to crates.io using its
+Production credential. Do not publish directly to crates.io from a shell or
+Actions. See `docs/repository-setup.md` for enrollment and credential setup.
