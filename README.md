@@ -65,8 +65,12 @@ turns HTTP/2 bytes into bounded state and events.
 Unit tests cover framing, HPACK state, Huffman decoding, and flow control.
 Differential tests in `tests/` exchange traffic with the Rust `h2`
 implementation, including a 4 MiB response that exercises flow-control updates,
-and compare HPACK in both directions with `fluke-hpack`. The tests use in-memory
-transports and require no external service.
+and compare HPACK in both directions with `fluke-hpack`. Protocol regressions
+fill all four stream slots on eight independent connections: a barrier ensures
+32 simultaneous streams, with 64 round trips across two waves. Each response
+exceeds the receive window; tests verify exact headers and echoed bytes,
+credit-buffer retries, negotiated limits, and valid and malformed continuation
+sequences. The tests use in-memory transports and require no external service.
 
 ```sh
 cargo fmt --all --check
