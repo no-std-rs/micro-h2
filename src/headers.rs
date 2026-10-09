@@ -13,6 +13,29 @@ pub(crate) fn scheme_valid(scheme: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"+-.".contains(&byte))
 }
 
+pub(crate) fn path_valid(method: &str, path: &str) -> bool {
+    if path == "*" {
+        return method == "OPTIONS";
+    }
+    // HTTP/2 uses absolute-path plus optional query, not a URI fragment.
+    if !path.starts_with('/') {
+        return false;
+    }
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            if !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                || !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+            {
+                return false;
+            }
+        } else if !byte.is_ascii_alphanumeric() && !b"-._~!$&'()*+,;=:@/?".contains(&byte) {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn value_valid(value: &str) -> bool {
     !value
         .bytes()

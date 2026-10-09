@@ -63,14 +63,16 @@ may precede the final headers; DATA requires final headers. Header names must be
 lowercase tokens, values must obey HTTP/2 field syntax, and connection-specific
 fields are refused.
 Content-Length counts unpadded body bytes and must match at END_STREAM, with the
-HEAD, 204, and 304 response exceptions. HEAD, 204, 205, and 304 responses cannot
+HEAD and 304 metadata exceptions. Ordinary 204 responses must omit Content-Length.
+HEAD, 204, 205, and 304 responses cannot
 deliver content. Malformed blocks are rejected before any header callback runs.
 Late frames on closed streams produce no application events, while preserving
 connection flow control and HPACK state. DATA after a successful CONNECT carries
 tunnel bytes and ignores response Content-Length.
 Outgoing fields and declared body lengths are checked before opening a stream
-or writing output; schemes must follow URI scheme grammar, and consistent
-duplicate Content-Length values are emitted once.
+or writing output; schemes and paths must follow URI grammar (including OPTIONS
+`*` and percent escapes), and consistent duplicate Content-Length values are
+emitted once.
 
 Transport adapters that consume DATA incrementally can call `finish_data` for
 unpadded frames. Padded frames require `finish_data_with_length`, supplying the

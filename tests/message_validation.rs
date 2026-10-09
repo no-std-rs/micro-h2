@@ -315,16 +315,17 @@ async fn informational_bodyless_and_padded_responses_remain_interoperable() {
     bounded(async {
         let mut tasks = JoinSet::new();
         for (method, status, length) in [
-            ("HEAD", "200", "123"),
-            ("GET", "204", "0"),
-            ("GET", "205", "0"),
-            ("GET", "304", "123"),
+            ("HEAD", "200", Some("123")),
+            ("GET", "204", None),
+            ("GET", "205", Some("0")),
+            ("GET", "304", Some("123")),
         ] {
             tasks.spawn(async move {
-                let frames = [headers(
-                    &[(":status", status), ("content-length", length)],
-                    true,
-                )];
+                let mut fields = vec![(":status", status)];
+                if let Some(length) = length {
+                    fields.push(("content-length", length));
+                }
+                let frames = [headers(&fields, true)];
                 let mut connection = connection(method);
                 assert!(matches!(
                     connection
@@ -420,6 +421,69 @@ fn invalid_requests_leave_stream_slots_identifiers_and_output_untouched() {
                 .0,
             1
         );
+    }
+}
+
+#[test]
+fn invalid_request_targets_leave_state_and_output_untouched() {
+    for (method, path) in [
+        ("GET", "relative"),
+        ("GET", "/bad path"),
+        ("GET", "/resource#fragment"),
+        ("GET", "/bad%"),
+        ("GET", "/bad%0"),
+        ("GET", "/bad%gg"),
+        ("GET", "/bad\\path"),
+        ("GET", "/bad[]"),
+        ("GET", "/ü"),
+        ("GET", "*"),
+        ("OPTIONS", "*?query"),
+        ("GET", ""),
+    ] {
+        let mut connection = Connection::new();
+        let mut out = [0xaa; 256];
+        for _ in 0..8 {
+            assert_eq!(
+                connection.request(method, path, "example.test", "http", &[], b"", &mut out),
+                Err(Error::Protocol),
+                "{method} {path:?}"
+            );
+            assert_eq!(out, [0xaa; 256]);
+            assert_eq!(connection.open_streams(), 0);
+        }
+        assert_eq!(
+            connection
+                .request("GET", "/", "example.test", "http", &[], b"", &mut out)
+                .unwrap()
+                .0,
+            1
+        );
+    }
+}
+
+#[test]
+fn no_content_responses_reject_declared_lengths_before_callbacks() {
+    for method in ["GET", "HEAD"] {
+        for length in ["0", "123"] {
+            for end in [false, true] {
+                let mut calls = 0;
+                let mut connection = connection(method);
+                let mut out = [0xaa; 64];
+                assert_eq!(
+                    connection
+                        .recv(
+                            &headers(&[(":status", "204"), ("content-length", length)], end),
+                            |_, _| calls += 1,
+                            &mut out
+                        )
+                        .err(),
+                    Some(Error::Protocol)
+                );
+                assert_eq!(calls, 0);
+                assert_eq!(out, [0xaa; 64]);
+                assert_eq!(connection.open_streams(), 1);
+            }
+        }
     }
 }
 
@@ -813,10 +877,16 @@ fn bodyless_responses_and_unsupported_trailers_cannot_deliver_content() {
     assert_eq!(calls, 0);
 }
 
-#[tokio::test]
-async fn normalized_request_fields_are_accepted_by_a_real_h2_server() {
+async fn request_round_trip(
+    method: &'static str,
+    path: &'static str,
+    fields: &[(&str, &str)],
+    content: &[u8],
+    normalized_fields: bool,
+) {
     bounded(async {
         let (mut io, peer) = tokio::io::duplex(64 * 1024);
+        let expected_body = content.to_vec();
         let server = tokio::spawn(async move {
             let mut connection = h2::server::handshake(peer).await.unwrap();
             let (request, mut response) = connection.accept().await.unwrap().unwrap();
@@ -824,15 +894,22 @@ async fn normalized_request_fields_are_accepted_by_a_real_h2_server() {
             let driver = tokio::spawn(async move {
                 let _ = connection.accept().await;
             });
-            assert_eq!(
-                request.headers().get_all("content-length").iter().count(),
-                1
-            );
-            assert_eq!(request.headers()["content-length"], "1");
-            assert_eq!(request.headers()["te"], "trailers");
+            assert_eq!(request.method(), method);
+            assert_eq!(request.uri().path_and_query().unwrap().as_str(), path);
+            if normalized_fields {
+                assert_eq!(
+                    request.headers().get_all("content-length").iter().count(),
+                    1
+                );
+                assert_eq!(request.headers()["content-length"], "1");
+                assert_eq!(request.headers()["te"], "trailers");
+            }
             let mut body = request.into_body();
-            assert_eq!(body.data().await.unwrap().unwrap().as_ref(), b"x");
-            assert!(body.data().await.is_none());
+            let mut received = Vec::new();
+            while let Some(chunk) = body.data().await {
+                received.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(received, expected_body);
             response
                 .send_response(
                     http::Response::builder().status(200).body(()).unwrap(),
@@ -847,16 +924,12 @@ async fn normalized_request_fields_are_accepted_by_a_real_h2_server() {
         io.write_all(&out[..len]).await.unwrap();
         let (_, len) = connection
             .request(
-                "POST",
-                "/",
+                method,
+                path,
                 "example.test",
                 "http",
-                &[
-                    ("content-length", "1, 1"),
-                    ("content-length", "01"),
-                    ("te", "TRAILERS"),
-                ],
-                b"x",
+                fields,
+                content,
                 &mut out,
             )
             .unwrap();
@@ -898,6 +971,43 @@ async fn normalized_request_fields_are_accepted_by_a_real_h2_server() {
         }
         drop(io);
         server.await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn normalized_request_fields_are_accepted_by_a_real_h2_server() {
+    request_round_trip(
+        "POST",
+        "/",
+        &[
+            ("content-length", "1, 1"),
+            ("content-length", "01"),
+            ("te", "TRAILERS"),
+        ],
+        b"x",
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn valid_request_targets_round_trip_with_h2_in_parallel() {
+    bounded(async {
+        let mut tasks = JoinSet::new();
+        for (method, path) in [
+            ("GET", "/"),
+            ("GET", "/a/b?x=y&ref=http://example.test/x?y=z"),
+            ("GET", "/escaped%20%2f%FF"),
+            ("GET", "//path//segments"),
+            ("GET", "/!$&'()*+,;=:@-._~"),
+            ("OPTIONS", "*"),
+        ] {
+            tasks.spawn(request_round_trip(method, path, &[], b"", false));
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
     })
     .await;
 }

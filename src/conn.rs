@@ -195,9 +195,7 @@ impl Connection {
             || !headers::value_valid(authority)
             || (method == "CONNECT" && authority.is_empty())
             || (method != "CONNECT"
-                && (path.is_empty()
-                    || !headers::value_valid(path)
-                    || !headers::scheme_valid(scheme)))
+                && (!headers::path_valid(method, path) || !headers::scheme_valid(scheme)))
         {
             return Err(Error::Protocol);
         }
@@ -446,8 +444,9 @@ impl Connection {
                         let entry = &mut self.streams[index];
                         let tunnel = entry.connect_request && (200..300).contains(&status);
                         if !tunnel
-                            && status == 205
-                            && fields.content_length.is_some_and(|length| length != 0)
+                            && ((status == 204 && fields.content_length.is_some())
+                                || (status == 205
+                                    && fields.content_length.is_some_and(|length| length != 0)))
                         {
                             return Err(Error::Protocol);
                         }
