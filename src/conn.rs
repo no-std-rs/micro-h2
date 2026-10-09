@@ -445,8 +445,15 @@ impl Connection {
                         }
                     } else {
                         let entry = &mut self.streams[index];
-                        let no_body = entry.head_request || matches!(status, 204 | 304);
                         let tunnel = entry.connect_request && (200..300).contains(&status);
+                        if !tunnel
+                            && status == 205
+                            && fields.content_length.is_some_and(|length| length != 0)
+                        {
+                            return Err(Error::Protocol);
+                        }
+                        let no_body =
+                            !tunnel && (entry.head_request || matches!(status, 204 | 205 | 304));
                         let expected = if no_body || tunnel {
                             None
                         } else {

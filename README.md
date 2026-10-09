@@ -58,13 +58,16 @@ and stop after GOAWAY. Discard the connection after a receive-side protocol or
 HPACK error.
 
 Responses must belong to a client-opened stream and carry exactly one valid
-`:status` before ordinary fields. Informational responses may precede the final
-headers; DATA requires final headers. Header names must be lowercase tokens,
-values must obey HTTP/2 field syntax, and connection-specific fields are refused.
+`:status` in the range 100–599 before ordinary fields. Informational responses
+may precede the final headers; DATA requires final headers. Header names must be
+lowercase tokens, values must obey HTTP/2 field syntax, and connection-specific
+fields are refused.
 Content-Length counts unpadded body bytes and must match at END_STREAM, with the
-HEAD, 204, and 304 response exceptions. Malformed blocks are rejected before any
-header callback runs. Late frames on closed streams produce no application
-events, while preserving connection flow control and HPACK state.
+HEAD, 204, and 304 response exceptions. HEAD, 204, 205, and 304 responses cannot
+deliver content. Malformed blocks are rejected before any header callback runs.
+Late frames on closed streams produce no application events, while preserving
+connection flow control and HPACK state. DATA after a successful CONNECT carries
+tunnel bytes and ignores response Content-Length.
 Outgoing fields and declared body lengths are checked before opening a stream
 or writing output; consistent duplicate Content-Length values are emitted once.
 

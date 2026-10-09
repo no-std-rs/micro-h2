@@ -74,7 +74,7 @@ impl ResponseHeaders {
             let status = u16::from(bytes[0] - b'0') * 100
                 + u16::from(bytes[1] - b'0') * 10
                 + u16::from(bytes[2] - b'0');
-            if status < 100 || status == 101 {
+            if !(100..=599).contains(&status) || status == 101 {
                 return Err(Error::Protocol);
             }
             self.status = Some(status);

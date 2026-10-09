@@ -236,6 +236,7 @@ fn generic_field_and_response_phase_rules_are_checked_before_callbacks() {
         vec![(":status", "101")],
         vec![(":status", "099")],
         vec![(":status", "103")],
+        vec![(":status", "205"), ("content-length", "1")],
         vec![
             (":status", "200"),
             ("content-length", "1"),
@@ -269,6 +270,46 @@ fn generic_field_and_response_phase_rules_are_checked_before_callbacks() {
     );
 }
 
+#[test]
+fn status_code_bounds_are_validated_before_delivery() {
+    for status in ["600", "999"] {
+        let mut calls = 0;
+        assert_eq!(
+            connection("GET")
+                .recv(
+                    &headers(&[(":status", status)], true),
+                    |_, _| calls += 1,
+                    &mut [0; 64]
+                )
+                .err(),
+            Some(Error::Protocol)
+        );
+        assert_eq!(calls, 0);
+    }
+    for status in ["100", "199", "200", "299", "599"] {
+        let mut seen = None;
+        let end_stream = !status.starts_with('1');
+        assert_eq!(
+            connection("GET")
+                .recv(
+                    &headers(&[(":status", status)], end_stream),
+                    |name, value| {
+                        assert_eq!(name, ":status");
+                        seen = Some(value.to_owned());
+                    },
+                    &mut [0; 64]
+                )
+                .unwrap()
+                .0,
+            Event::Headers {
+                stream: 1,
+                end_stream
+            }
+        );
+        assert_eq!(seen.as_deref(), Some(status));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn informational_bodyless_and_padded_responses_remain_interoperable() {
     bounded(async {
@@ -276,6 +317,7 @@ async fn informational_bodyless_and_padded_responses_remain_interoperable() {
         for (method, status, length) in [
             ("HEAD", "200", "123"),
             ("GET", "204", "0"),
+            ("GET", "205", "0"),
             ("GET", "304", "123"),
         ] {
             tasks.spawn(async move {
@@ -423,6 +465,35 @@ fn duplicate_lengths_and_connect_pseudo_headers_are_unambiguous() {
             (":authority".into(), "example.test:443".into())
         ]
     );
+    for status in ["200", "204", "205"] {
+        let mut tunnel = Connection::new();
+        tunnel
+            .request("CONNECT", "", "example.test:443", "", &[], b"", &mut out)
+            .unwrap();
+        tunnel
+            .recv(
+                &headers(&[(":status", status), ("content-length", "123")], false),
+                |_, _| {},
+                &mut out,
+            )
+            .unwrap();
+        assert!(matches!(
+            tunnel
+                .recv(
+                    &wire(FrameType::Data, flags::END_STREAM, 1, b"x"),
+                    |_, _| {},
+                    &mut out
+                )
+                .unwrap()
+                .0,
+            Event::Data {
+                data: b"x",
+                end_stream: true,
+                ..
+            }
+        ));
+        assert_eq!(tunnel.open_streams(), 0);
+    }
     let mut connection = Connection::new();
     let (_, len) = connection
         .request(
@@ -647,25 +718,35 @@ fn streamed_data_retries_credit_without_committing_body_bytes_or_closure() {
 
 #[test]
 fn bodyless_responses_and_unsupported_trailers_cannot_deliver_content() {
-    for (method, status) in [("HEAD", "200"), ("GET", "204"), ("GET", "304")] {
-        let mut connection = connection(method);
-        connection
-            .recv(
-                &headers(&[(":status", status)], false),
-                |_, _| {},
-                &mut [0; 64],
-            )
-            .unwrap();
-        assert_eq!(
+    for (method, status) in [
+        ("HEAD", "200"),
+        ("GET", "204"),
+        ("GET", "205"),
+        ("GET", "304"),
+    ] {
+        for streamed in [false, true] {
+            let mut connection = connection(method);
             connection
                 .recv(
-                    &wire(FrameType::Data, flags::END_STREAM, 1, b"x"),
+                    &headers(&[(":status", status)], false),
                     |_, _| {},
-                    &mut [0; 64]
+                    &mut [0; 64],
                 )
-                .err(),
-            Some(Error::Protocol)
-        );
+                .unwrap();
+            let data = wire(FrameType::Data, flags::END_STREAM, 1, b"x");
+            let error = if streamed {
+                connection
+                    .finish_data(FrameHeader::parse(&data).unwrap(), &mut [0; 64])
+                    .err()
+            } else {
+                connection.recv(&data, |_, _| {}, &mut [0; 64]).err()
+            };
+            assert_eq!(
+                error,
+                Some(Error::Protocol),
+                "{method} {status}, streamed={streamed}"
+            );
+        }
     }
     let mut connection = connection("GET");
     connection
