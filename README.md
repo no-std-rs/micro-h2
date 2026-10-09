@@ -109,6 +109,33 @@ cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
 Install the cross-compilation targets with `rustup target add` before checking
 them locally. CI checks both with the Rust 1.88 minimum supported version.
 
+## Benchmarks
+
+Two independent benchmark modes exercise the throughput and memory ends of the
+spectrum, using the same allocation-free library:
+
+```sh
+cargo bench --locked --bench throughput
+cargo bench --locked --bench memory
+```
+
+The throughput benchmark compares `memcpy` (`copy_from_slice`), `recv` plus a
+body copy, and direct adapter delivery plus `finish_data`, using identical
+payloads and buffers. It reports measured ratios to the local memcpy baseline
+for hot buffers and 64 MiB sweeps, at 1, 4, and 16 KiB per frame. Borrowed DATA
+delivery is measured separately as protocol overhead.
+
+The memory benchmark enforces a **50,000-byte workload heap budget**, including
+the connection, scripted peer, transport buffers, and application sink. It
+verifies 128 MiB per adapter with four concurrent streams and repeated stream
+reuse, with one setup allocation and zero protocol allocations. Both complete
+16 KiB frames and incremental 512-byte chunks are exercised. This is a heap
+budget; host runtime, allocator metadata, and stack are excluded.
+
+See [benchmark methodology](docs/benchmarks.md) for measurement boundaries and
+reproducible commands. Add `-- --quick` for a short correctness run; CI enforces
+the memory budget without machine-dependent timing thresholds.
+
 ## Contributing and releases
 
 See [AGENTS.md](AGENTS.md) for validation and Conventional Commit PR titles,
