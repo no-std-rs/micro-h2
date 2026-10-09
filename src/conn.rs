@@ -25,7 +25,7 @@
 
 use crate::frame::{self, FrameHeader, FrameType, flags, settings};
 use crate::hpack::{self, Decoder};
-use crate::{Error, hpack::encode};
+use crate::{Error, headers, hpack::encode};
 
 /// How many requests may be in flight at once. Registration and the map
 /// long-poll, with one spare.
@@ -54,13 +54,20 @@ struct Stream {
     consumed: u32,
     open: bool,
     send_window: i64,
+    head_request: bool,
+    connect_request: bool,
+    response_started: bool,
+    no_body: bool,
+    content_length: Option<u64>,
+    received: u64,
 }
 
 /// What arrived.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event<'a> {
     /// Nothing the caller needs to act on: a settings exchange, a ping, an
-    /// unknown frame type. Anything that needed a reply is already in `out`.
+    /// unknown frame type, or a late frame on a closed stream. Anything that
+    /// needed a reply is already in `out`.
     Nothing,
     /// A complete header block. The fields were passed to the callback.
     Headers { stream: u32, end_stream: bool },
@@ -161,6 +168,8 @@ impl Connection {
     /// Open a stream and send a request, headers and body together.
     ///
     /// Returns the stream identifier and how many bytes were written.
+    /// The authority argument is authoritative; redundant `host` fields are
+    /// omitted. If it is empty, a single `host` field supplies `:authority`.
     #[allow(clippy::too_many_arguments)]
     pub fn request(
         &mut self,
@@ -183,16 +192,70 @@ impl Connection {
             return Err(Error::TooManyStreams);
         }
 
+        if method.is_empty()
+            || !method.bytes().all(headers::token)
+            || (method != "CONNECT"
+                && (!headers::path_valid(method, path) || !headers::scheme_valid(scheme)))
+        {
+            return Err(Error::Protocol);
+        }
+        let mut content_length = None;
+        let mut host = None;
+        for &(name, value) in extra {
+            headers::field(name, value, true)?;
+            if name == "host" && authority.is_empty() && host.replace(value).is_some() {
+                return Err(Error::Protocol);
+            }
+            if name == "content-length" {
+                headers::content_length(value, &mut content_length)?;
+            }
+        }
+        let authority = if authority.is_empty() {
+            host.unwrap_or("")
+        } else {
+            authority
+        };
+        if !headers::authority_valid(authority, scheme, method == "CONNECT") {
+            return Err(Error::Protocol);
+        }
+        if content_length.is_some_and(|length| length != body.len() as u64) {
+            return Err(Error::Protocol);
+        }
+
         // Pseudo-headers must come first and in this order; a server is entitled
         // to reject a block that interleaves them with ordinary fields.
         let mut block = [0u8; MAX_HEADER_BLOCK];
         let mut block_len = 0;
         block_len = encode::encode_header(":method", method, &mut block, block_len)?;
-        block_len = encode::encode_header(":path", path, &mut block, block_len)?;
-        block_len = encode::encode_header(":scheme", scheme, &mut block, block_len)?;
-        block_len = encode::encode_header(":authority", authority, &mut block, block_len)?;
+        if method != "CONNECT" {
+            block_len = encode::encode_header(":path", path, &mut block, block_len)?;
+            block_len = encode::encode_header(":scheme", scheme, &mut block, block_len)?;
+        }
+        if !authority.is_empty() {
+            block_len = encode::encode_header(":authority", authority, &mut block, block_len)?;
+        }
+        let mut length_written = false;
         for (name, value) in extra {
-            block_len = encode::encode_header(name, value, &mut block, block_len)?;
+            // Direct HTTP/2 clients convey routing through :authority. Omit
+            // Host so callers cannot emit conflicting routing identities.
+            if *name == "host" {
+                continue;
+            }
+            if *name == "content-length" {
+                if length_written {
+                    continue;
+                }
+                // Emit the already-validated length once in canonical form.
+                // Receivers need not normalize duplicate/list forms themselves.
+                use core::fmt::Write;
+                let mut canonical = heapless::String::<20>::new();
+                write!(&mut canonical, "{}", body.len()).map_err(|_| Error::BufferTooSmall)?;
+                block_len = encode::encode_header(name, &canonical, &mut block, block_len)?;
+                length_written = true;
+            } else {
+                let value = if *name == "te" { "trailers" } else { value };
+                block_len = encode::encode_header(name, value, &mut block, block_len)?;
+            }
         }
 
         // No CONTINUATION is emitted: a header block that does not fit one frame
@@ -247,6 +310,12 @@ impl Connection {
                 consumed: 0,
                 open: true,
                 send_window: self.peer_initial_window as i64 - body.len() as i64,
+                head_request: method == "HEAD",
+                connect_request: method == "CONNECT",
+                response_started: false,
+                no_body: false,
+                content_length: None,
+                received: 0,
             })
             .map_err(|_| Error::TooManyStreams)?;
         self.next_stream += 2;
@@ -309,6 +378,13 @@ impl Connection {
             }
             _ => {}
         }
+        if matches!(
+            header.kind,
+            FrameType::Headers | FrameType::Data | FrameType::RstStream | FrameType::WindowUpdate
+        ) && header.stream != 0
+        {
+            self.known_stream(header.stream)?;
+        }
         let mut written = 0;
 
         match header.kind {
@@ -358,9 +434,68 @@ impl Connection {
 
                 let stream = self.header_stream;
                 let end_stream = self.header_end_stream;
-                self.decoder.decode(&self.header_block, &mut on_header)?;
+                let active = self.streams.iter().position(|entry| entry.id == stream);
+                if let Some(index) = active {
+                    if self.streams[index].response_started {
+                        // Trailers remain outside this client's supported surface.
+                        return Err(Error::Protocol);
+                    }
+                    // Validate the whole block before any fields escape to the caller.
+                    // The fixed-size clone keeps the real HPACK table at its starting
+                    // state for the delivery pass; each insertion commits only once.
+                    let mut preflight = self.decoder.clone();
+                    let mut fields = headers::ResponseHeaders::default();
+                    let mut valid = Ok(());
+                    preflight.decode(&self.header_block, |name, value| {
+                        if valid.is_ok() {
+                            valid = fields.field(name, value);
+                        }
+                    })?;
+                    valid?;
+                    let status = fields.status.ok_or(Error::Protocol)?;
+                    if status < 200 {
+                        if end_stream || fields.content_length.is_some() {
+                            return Err(Error::Protocol);
+                        }
+                    } else {
+                        let entry = &mut self.streams[index];
+                        let tunnel = entry.connect_request && (200..300).contains(&status);
+                        // RFC 9110 section 9.3.6 requires clients to ignore a
+                        // successful CONNECT's Content-Length. Ordinary 205
+                        // has zero-length content, unlike the HEAD/304 metadata
+                        // exceptions in sections 6.4.1 and 8.6.
+                        if !tunnel
+                            && ((status == 204 && fields.content_length.is_some())
+                                || (status == 205
+                                    && fields.content_length.is_some_and(|length| length != 0)))
+                        {
+                            return Err(Error::Protocol);
+                        }
+                        let no_body =
+                            !tunnel && (entry.head_request || matches!(status, 204 | 205 | 304));
+                        let expected = if no_body || tunnel {
+                            None
+                        } else {
+                            fields.content_length
+                        };
+                        if end_stream && expected.is_some_and(|length| length != 0) {
+                            return Err(Error::Protocol);
+                        }
+                        entry.response_started = true;
+                        entry.no_body = no_body;
+                        entry.content_length = expected;
+                    }
+                    self.decoder.decode(&self.header_block, &mut on_header)?;
+                } else {
+                    // Late fields on closed streams still affect connection-wide
+                    // HPACK state, but must not become application headers.
+                    self.decoder.decode(&self.header_block, |_, _| {})?;
+                }
                 self.header_stream = 0;
                 self.header_block.clear();
+                if active.is_none() {
+                    return Ok((Event::Nothing, 0));
+                }
                 if end_stream {
                     self.close(stream);
                 }
@@ -369,10 +504,21 @@ impl Connection {
 
             FrameType::Data => {
                 let data = frame::strip_padding(payload, header.flags)?;
+                let end_stream = header.has(flags::END_STREAM);
+                let active = self
+                    .streams
+                    .iter()
+                    .position(|entry| entry.id == header.stream);
+                let received = active
+                    .map(|index| self.data_length(index, data.len(), end_stream))
+                    .transpose()?;
                 // The window is consumed by the whole payload, padding included,
                 // not just the bytes we hand back.
                 written = self.credit(header.stream, header.length as u32, out)?;
-                let end_stream = header.has(flags::END_STREAM);
+                let Some(index) = active else {
+                    return Ok((Event::Nothing, written));
+                };
+                self.streams[index].received = received.unwrap();
                 if end_stream {
                     self.close(header.stream);
                 }
@@ -388,6 +534,9 @@ impl Connection {
 
             FrameType::RstStream => {
                 let code = read_u32(payload).ok_or(Error::Protocol)?;
+                if !self.streams.iter().any(|entry| entry.id == header.stream) {
+                    return Ok((Event::Nothing, 0));
+                }
                 self.close(header.stream);
                 Ok((
                     Event::Reset {
@@ -443,19 +592,81 @@ impl Connection {
     /// DATA does not affect HPACK state, so constrained adapters can stream a
     /// large payload without retaining the complete frame. Flow-control credit
     /// and stream closure still happen exactly once, after every payload byte
-    /// (including padding) has been authenticated and consumed.
+    /// has been authenticated and consumed. For padded frames, use
+    /// [`Self::finish_data_with_length`] to supply the unpadded content length.
     pub fn finish_data(&mut self, header: FrameHeader, out: &mut [u8]) -> Result<usize, Error> {
+        if header.has(flags::PADDED) {
+            return Err(Error::Protocol);
+        }
+        self.finish_data_with_length(header, header.length, out)
+    }
+
+    /// Complete a streamed DATA frame, supplying the unpadded content length.
+    /// The adapter must validate the padding byte and consume the full payload
+    /// before calling this method. Credit includes padding; Content-Length does not.
+    pub fn finish_data_with_length(
+        &mut self,
+        header: FrameHeader,
+        data_length: usize,
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
         if header.kind != FrameType::Data || header.stream == 0 || self.header_stream != 0 {
             return Err(Error::Protocol);
         }
         if header.length > frame::DEFAULT_MAX_FRAME {
             return Err(Error::FrameTooLarge);
         }
+        let padding = header
+            .length
+            .checked_sub(data_length)
+            .ok_or(Error::Protocol)?;
+        if (header.has(flags::PADDED) && !(1..=256).contains(&padding))
+            || (!header.has(flags::PADDED) && padding != 0)
+        {
+            return Err(Error::Protocol);
+        }
+        self.known_stream(header.stream)?;
+        let active = self
+            .streams
+            .iter()
+            .position(|entry| entry.id == header.stream);
+        let received = active
+            .map(|index| self.data_length(index, data_length, header.has(flags::END_STREAM)))
+            .transpose()?;
         let written = self.credit(header.stream, header.length as u32, out)?;
+        if let Some(index) = active {
+            self.streams[index].received = received.unwrap();
+        }
         if header.has(flags::END_STREAM) {
             self.close(header.stream);
         }
         Ok(written)
+    }
+
+    fn known_stream(&self, stream: u32) -> Result<(), Error> {
+        // Push is disabled; only odd streams actually opened by us can exist.
+        if stream & 1 == 0 || stream >= self.next_stream {
+            return Err(Error::Protocol);
+        }
+        Ok(())
+    }
+
+    fn data_length(&self, index: usize, length: usize, end_stream: bool) -> Result<u64, Error> {
+        let entry = &self.streams[index];
+        if !entry.response_started || (entry.no_body && length != 0) {
+            return Err(Error::Protocol);
+        }
+        let received = entry
+            .received
+            .checked_add(length as u64)
+            .ok_or(Error::Protocol)?;
+        if entry
+            .content_length
+            .is_some_and(|expected| received > expected || (end_stream && received != expected))
+        {
+            return Err(Error::Protocol);
+        }
+        Ok(received)
     }
 
     /// Return flow-control credit for `length` bytes consumed on `stream`.
@@ -586,6 +797,21 @@ mod tests {
         out
     }
 
+    fn open_connection() -> Connection {
+        let mut connection = Connection::new();
+        connection
+            .request("GET", "/", "h", "https", &[], b"", &mut [0; 256])
+            .unwrap();
+        connection
+    }
+
+    fn response_connection() -> Connection {
+        let mut connection = open_connection();
+        let headers = frame_bytes(FrameType::Headers, flags::END_HEADERS, 1, &[0x88]);
+        connection.recv(&headers, |_, _| {}, &mut [0; 64]).unwrap();
+        connection
+    }
+
     #[test]
     fn the_preface_is_exactly_what_the_rfc_requires() {
         let mut connection = Connection::new();
@@ -697,10 +923,10 @@ mod tests {
     fn a_header_block_split_across_continuation_frames_is_reassembled() {
         // Decoding either half alone would corrupt the HPACK table for the rest
         // of the connection, so the partial frame must produce no event at all.
-        let mut connection = Connection::new();
+        let mut connection = open_connection();
         let mut out = [0u8; 256];
 
-        // ":status: 200" then ":method: GET", as two indexed fields.
+        // A status followed by an ordinary field, split between frames.
         let first = frame_bytes(FrameType::Headers, 0, 1, &[0x88]);
         let (event, _) = connection.recv(&first, |_, _| {}, &mut out).unwrap();
         assert_eq!(
@@ -710,7 +936,12 @@ mod tests {
         );
 
         let mut seen = heapless::Vec::<(heapless::String<32>, heapless::String<32>), 4>::new();
-        let second = frame_bytes(FrameType::Continuation, flags::END_HEADERS, 1, &[0x82]);
+        let second = frame_bytes(
+            FrameType::Continuation,
+            flags::END_HEADERS,
+            1,
+            &[0, 1, b'x', 1, b'y'],
+        );
         let (event, _) = connection
             .recv(
                 &second,
@@ -729,12 +960,12 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].0.as_str(), ":status");
         assert_eq!(seen[0].1.as_str(), "200");
-        assert_eq!(seen[1].0.as_str(), ":method");
+        assert_eq!(seen[1].0.as_str(), "x");
     }
 
     #[test]
     fn data_returns_the_payload_and_eventually_a_window_update() {
-        let mut connection = Connection::new();
+        let mut connection = response_connection();
         let mut out = [0u8; 256];
 
         let data = frame_bytes(FrameType::Data, 0, 1, b"hello");
@@ -756,7 +987,7 @@ mod tests {
     fn a_long_response_gets_its_window_topped_up_before_it_can_stall() {
         // The regression test for the failure mode that looks like a server
         // fault: without this the peer stops after 65535 bytes.
-        let mut connection = Connection::new();
+        let mut connection = response_connection();
         let mut out = [0u8; 256];
         let payload = [0u8; 400];
 
@@ -787,7 +1018,7 @@ mod tests {
 
     #[test]
     fn padding_and_priority_are_stripped_before_hpack_sees_the_block() {
-        let mut connection = Connection::new();
+        let mut connection = open_connection();
         let mut out = [0u8; 256];
         // pad length 2, priority (5 bytes), the block, then the padding.
         let payload = [2, 0, 0, 0, 0, 0, 0x88, 0xaa, 0xbb];
@@ -814,7 +1045,7 @@ mod tests {
 
     #[test]
     fn goaway_and_reset_are_reported_rather_than_hidden() {
-        let mut connection = Connection::new();
+        let mut connection = open_connection();
         let mut out = [0u8; 128];
 
         let reset = frame_bytes(FrameType::RstStream, 0, 1, &[0, 0, 0, 8]);
@@ -873,7 +1104,7 @@ mod tests {
             (FrameType::Ping, 0),
             (FrameType::Headers, 3),
         ] {
-            let mut connection = Connection::new();
+            let mut connection = open_connection();
             let mut out = [0u8; 128];
             let first = frame_bytes(FrameType::Headers, 0, 1, &[0x88]);
             connection.recv(&first, |_, _| {}, &mut out).unwrap();
@@ -883,7 +1114,7 @@ mod tests {
                 Some(Error::Protocol)
             );
         }
-        let mut connection = Connection::new();
+        let mut connection = open_connection();
         let orphan = frame_bytes(FrameType::Continuation, flags::END_HEADERS, 1, &[0x88]);
         assert_eq!(
             connection.recv(&orphan, |_, _| {}, &mut [0u8; 128]).err(),
@@ -943,6 +1174,8 @@ mod tests {
         let (id, _) = connection
             .request("GET", "/", "h", "https", &[], b"", &mut out)
             .unwrap();
+        let headers = frame_bytes(FrameType::Headers, flags::END_HEADERS, id, &[0x88]);
+        connection.recv(&headers, |_, _| {}, &mut out).unwrap();
         connection.consumed = RECEIVE_WINDOW / 2 - 1;
         connection.streams[0].consumed = RECEIVE_WINDOW / 2 - 1;
         let data = frame_bytes(FrameType::Data, 0, id, b"a");

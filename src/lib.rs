@@ -39,6 +39,7 @@
 
 pub mod conn;
 pub mod frame;
+mod headers;
 pub mod hpack;
 
 pub use conn::{Connection, Event};

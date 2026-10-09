@@ -36,6 +36,7 @@ pub const MAX_ENTRY_LEN: usize = 224;
 /// tables diverge.
 const ENTRY_OVERHEAD: usize = 32;
 
+#[derive(Clone)]
 struct Entry {
     name: heapless::String<MAX_ENTRY_LEN>,
     value: heapless::String<MAX_ENTRY_LEN>,
@@ -48,6 +49,7 @@ impl Entry {
 }
 
 /// The decoder's view of the table the peer is building.
+#[derive(Clone)]
 pub struct DynamicTable {
     /// Newest first, so index 62 is `entries[0]`.
     entries: heapless::Deque<Entry, MAX_ENTRIES>,
