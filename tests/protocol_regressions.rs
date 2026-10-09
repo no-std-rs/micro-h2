@@ -599,6 +599,9 @@ async fn continuation_and_control_frame_regressions_match_the_reference_peer() {
             let first = first.clone();
             cases.spawn(async move {
                 let mut connection = Connection::new();
+                connection
+                    .request("GET", "/", "example.test", "http", &[], b"", &mut [0; 256])
+                    .unwrap();
                 connection.recv(&first, |_, _| {}, &mut [0; 64]).unwrap();
                 assert_eq!(
                     connection.recv(&interloper, |_, _| {}, &mut [0; 64]).err(),
@@ -649,10 +652,12 @@ async fn invalid_hpack_blocks_are_rejected_by_micro_h2_and_the_reference_peer() 
                     1,
                     &block,
                 );
+                let mut connection = Connection::new();
+                connection
+                    .request("GET", "/", "example.test", "http", &[], b"", &mut [0; 256])
+                    .unwrap();
                 assert_eq!(
-                    Connection::new()
-                        .recv(&bytes, |_, _| {}, &mut [0; 64])
-                        .err(),
+                    connection.recv(&bytes, |_, _| {}, &mut [0; 64]).err(),
                     Some(Error::Hpack)
                 );
                 reference_rejects(vec![bytes]).await;

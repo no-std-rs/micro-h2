@@ -57,6 +57,23 @@ or SETTINGS before retrying. New requests also respect MAX_CONCURRENT_STREAMS
 and stop after GOAWAY. Discard the connection after a receive-side protocol or
 HPACK error.
 
+Responses must belong to a client-opened stream and carry exactly one valid
+`:status` before ordinary fields. Informational responses may precede the final
+headers; DATA requires final headers. Header names must be lowercase tokens,
+values must obey HTTP/2 field syntax, and connection-specific fields are refused.
+Content-Length counts unpadded body bytes and must match at END_STREAM, with the
+HEAD, 204, and 304 response exceptions. Malformed blocks are rejected before any
+header callback runs. Late frames on closed streams produce no application
+events, while preserving connection flow control and HPACK state.
+Outgoing fields and declared body lengths are checked before opening a stream
+or writing output; consistent duplicate Content-Length values are emitted once.
+
+Transport adapters that consume DATA incrementally can call `finish_data` for
+unpadded frames. Padded frames require `finish_data_with_length`, supplying the
+content length after the adapter validates and consumes the padding. Both paths
+enforce response state and body lengths, and permit a larger-output-buffer retry
+without counting the same bytes twice.
+
 TLS, TCP, retries, and request scheduling belong to the caller. This crate only
 turns HTTP/2 bytes into bounded state and events.
 

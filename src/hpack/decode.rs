@@ -38,6 +38,7 @@ pub struct Header {
 /// One decoder per connection, never one per message: the table is connection
 /// state, and a fresh decoder for each response would resolve every index the
 /// server sent against an empty table.
+#[derive(Clone)]
 pub struct Decoder {
     table: DynamicTable,
     max_capacity: usize,
