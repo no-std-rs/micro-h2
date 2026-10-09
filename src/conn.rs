@@ -168,6 +168,8 @@ impl Connection {
     /// Open a stream and send a request, headers and body together.
     ///
     /// Returns the stream identifier and how many bytes were written.
+    /// The authority argument is authoritative; redundant `host` fields are
+    /// omitted. If it is empty, a single `host` field supplies `:authority`.
     #[allow(clippy::too_many_arguments)]
     pub fn request(
         &mut self,
@@ -192,19 +194,29 @@ impl Connection {
 
         if method.is_empty()
             || !method.bytes().all(headers::token)
-            || !headers::value_valid(authority)
-            || (method == "CONNECT" && authority.is_empty())
             || (method != "CONNECT"
                 && (!headers::path_valid(method, path) || !headers::scheme_valid(scheme)))
         {
             return Err(Error::Protocol);
         }
         let mut content_length = None;
+        let mut host = None;
         for &(name, value) in extra {
             headers::field(name, value, true)?;
+            if name == "host" && authority.is_empty() && host.replace(value).is_some() {
+                return Err(Error::Protocol);
+            }
             if name == "content-length" {
                 headers::content_length(value, &mut content_length)?;
             }
+        }
+        let authority = if authority.is_empty() {
+            host.unwrap_or("")
+        } else {
+            authority
+        };
+        if !headers::authority_valid(authority, scheme, method == "CONNECT") {
+            return Err(Error::Protocol);
         }
         if content_length.is_some_and(|length| length != body.len() as u64) {
             return Err(Error::Protocol);
@@ -224,6 +236,11 @@ impl Connection {
         }
         let mut length_written = false;
         for (name, value) in extra {
+            // Direct HTTP/2 clients convey routing through :authority. Omit
+            // Host so callers cannot emit conflicting routing identities.
+            if *name == "host" {
+                continue;
+            }
             if *name == "content-length" {
                 if length_written {
                     continue;
@@ -443,6 +460,10 @@ impl Connection {
                     } else {
                         let entry = &mut self.streams[index];
                         let tunnel = entry.connect_request && (200..300).contains(&status);
+                        // RFC 9110 section 9.3.6 requires clients to ignore a
+                        // successful CONNECT's Content-Length. Ordinary 205
+                        // has zero-length content, unlike the HEAD/304 metadata
+                        // exceptions in sections 6.4.1 and 8.6.
                         if !tunnel
                             && ((status == 204 && fields.content_length.is_some())
                                 || (status == 205

@@ -13,6 +13,80 @@ pub(crate) fn scheme_valid(scheme: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"+-.".contains(&byte))
 }
 
+fn uri_name_valid(value: &str, userinfo: bool) -> bool {
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            if !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                || !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+            {
+                return false;
+            }
+        } else if !byte.is_ascii_alphanumeric()
+            && !b"-._~!$&'()*+,;=".contains(&byte)
+            && !(userinfo && byte == b':')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn authority_valid(authority: &str, scheme: &str, connect: bool) -> bool {
+    // RFC 3986 section 3.2: [userinfo@] host [:port]. HTTP(S) and CONNECT
+    // prohibit userinfo; other schemes can carry it (RFC 9113 section 8.3.1).
+    let http = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
+    let host_port = if let Some((userinfo, host_port)) = authority.split_once('@') {
+        if connect || http || !uri_name_valid(userinfo, true) {
+            return false;
+        }
+        host_port
+    } else {
+        authority
+    };
+    let (host, port) = if let Some(literal) = host_port.strip_prefix('[') {
+        let Some((address, tail)) = literal.split_once(']') else {
+            return false;
+        };
+        let valid = if let Some(versioned) = address.strip_prefix(['v', 'V']) {
+            versioned.split_once('.').is_some_and(|(version, name)| {
+                !version.is_empty()
+                    && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && !name.is_empty()
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:".contains(&byte)
+                    })
+            })
+        } else {
+            address.parse::<core::net::Ipv6Addr>().is_ok()
+        };
+        if !valid || (!tail.is_empty() && !tail.starts_with(':')) {
+            return false;
+        }
+        (address, tail.strip_prefix(':'))
+    } else {
+        let (host, port) = host_port
+            .split_once(':')
+            .map_or((host_port, None), |(host, port)| (host, Some(port)));
+        if !uri_name_valid(host, false) {
+            return false;
+        }
+        (host, port)
+    };
+    if (http || connect) && host.is_empty() {
+        return false;
+    }
+    if connect {
+        // CONNECT has no scheme default: its TCP destination requires a port.
+        port.is_some_and(|port| {
+            port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|number| number != 0)
+        })
+    } else {
+        port.is_none_or(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+    }
+}
+
 pub(crate) fn path_valid(method: &str, path: &str) -> bool {
     if path == "*" {
         return method == "OPTIONS";

@@ -531,6 +531,131 @@ fn invalid_schemes_leave_request_state_and_output_untouched() {
 }
 
 #[test]
+fn invalid_authorities_leave_request_state_and_output_untouched() {
+    for authority in [
+        "",
+        "bad host",
+        "user@example.test",
+        "example.test/path",
+        "example.test?x",
+        "example.test#x",
+        "example.test\\x",
+        "example.test:abc",
+        "example.test:80:90",
+        "[::1",
+        "[no-ip]",
+        "::1",
+        "[::1]extra",
+        "[vX.name]",
+        "[v1.]",
+        "exa%mple",
+        "ex%0",
+        "ex%GG",
+        "éxample.test",
+        "[::1%25eth0]",
+    ] {
+        for fallback in [false, true] {
+            let mut connection = Connection::new();
+            let mut out = [0xaa; 256];
+            let fields = [("host", authority)];
+            for _ in 0..8 {
+                assert_eq!(
+                    connection.request(
+                        "GET",
+                        "/",
+                        if fallback { "" } else { authority },
+                        "http",
+                        if fallback { &fields } else { &[] },
+                        b"",
+                        &mut out
+                    ),
+                    Err(Error::Protocol),
+                    "{authority:?}, fallback={fallback}"
+                );
+                assert_eq!(out, [0xaa; 256]);
+                assert_eq!(connection.open_streams(), 0);
+            }
+            assert_eq!(
+                connection
+                    .request("GET", "/", "example.test", "http", &[], b"", &mut out)
+                    .unwrap()
+                    .0,
+                1
+            );
+        }
+    }
+    for authority in [
+        "example.test",
+        "example.test:",
+        "example.test:0",
+        "example.test:65536",
+        "example.test:+443",
+        "user@example.test:443",
+    ] {
+        let mut connection = Connection::new();
+        let mut out = [0xaa; 256];
+        assert_eq!(
+            connection.request("CONNECT", "", authority, "", &[], b"", &mut out),
+            Err(Error::Protocol),
+            "{authority:?}"
+        );
+        assert_eq!(out, [0xaa; 256]);
+        assert_eq!(connection.open_streams(), 0);
+    }
+    let mut connection = Connection::new();
+    assert_eq!(
+        connection.request(
+            "GET",
+            "/",
+            "",
+            "http",
+            &[("host", "a"), ("host", "b")],
+            b"",
+            &mut [0; 256]
+        ),
+        Err(Error::Protocol)
+    );
+}
+
+#[test]
+fn request_authority_is_the_only_routing_field() {
+    for (authority, fields, expected) in [
+        ("example.test", vec![("host", "other.test")], "example.test"),
+        (
+            "example.test",
+            vec![("host", "EXAMPLE.TEST:80")],
+            "example.test",
+        ),
+        (
+            "example.test",
+            vec![("host", "a"), ("host", "b")],
+            "example.test",
+        ),
+        (
+            "",
+            vec![("host", "fallback.test:8080")],
+            "fallback.test:8080",
+        ),
+    ] {
+        let mut connection = Connection::new();
+        let mut out = [0; 256];
+        let (_, len) = connection
+            .request("GET", "/", authority, "http", &fields, b"", &mut out)
+            .unwrap();
+        let decoded = fluke_hpack::Decoder::new()
+            .decode(&out[frame::HEADER_LEN..len])
+            .unwrap();
+        assert!(decoded.iter().all(|(name, _)| name != b"host"));
+        let authorities: Vec<_> = decoded
+            .iter()
+            .filter(|(name, _)| name == b":authority")
+            .map(|(_, value)| value.as_slice())
+            .collect();
+        assert_eq!(authorities, [expected.as_bytes()]);
+    }
+}
+
+#[test]
 fn duplicate_lengths_and_connect_pseudo_headers_are_unambiguous() {
     let mut connection = connection("GET");
     connection
@@ -880,6 +1005,8 @@ fn bodyless_responses_and_unsupported_trailers_cannot_deliver_content() {
 async fn request_round_trip(
     method: &'static str,
     path: &'static str,
+    authority: &'static str,
+    expected_authority: &'static str,
     fields: &[(&str, &str)],
     content: &[u8],
     normalized_fields: bool,
@@ -896,6 +1023,13 @@ async fn request_round_trip(
             });
             assert_eq!(request.method(), method);
             assert_eq!(request.uri().path_and_query().unwrap().as_str(), path);
+            if path != "*" {
+                assert_eq!(
+                    request.uri().authority().unwrap().as_str(),
+                    expected_authority
+                );
+            }
+            assert!(request.headers().get("host").is_none());
             if normalized_fields {
                 assert_eq!(
                     request.headers().get_all("content-length").iter().count(),
@@ -923,15 +1057,7 @@ async fn request_round_trip(
         let len = connection.start(&mut out).unwrap();
         io.write_all(&out[..len]).await.unwrap();
         let (_, len) = connection
-            .request(
-                method,
-                path,
-                "example.test",
-                "http",
-                fields,
-                content,
-                &mut out,
-            )
+            .request(method, path, authority, "http", fields, content, &mut out)
             .unwrap();
         io.write_all(&out[..len]).await.unwrap();
         loop {
@@ -980,6 +1106,8 @@ async fn normalized_request_fields_are_accepted_by_a_real_h2_server() {
     request_round_trip(
         "POST",
         "/",
+        "example.test",
+        "example.test",
         &[
             ("content-length", "1, 1"),
             ("content-length", "01"),
@@ -1003,11 +1131,96 @@ async fn valid_request_targets_round_trip_with_h2_in_parallel() {
             ("GET", "/!$&'()*+,;=:@-._~"),
             ("OPTIONS", "*"),
         ] {
-            tasks.spawn(request_round_trip(method, path, &[], b"", false));
+            tasks.spawn(request_round_trip(
+                method,
+                path,
+                "example.test",
+                "example.test",
+                &[],
+                b"",
+                false,
+            ));
         }
         while let Some(result) = tasks.join_next().await {
             result.unwrap();
         }
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn valid_authorities_and_host_fallback_round_trip_with_h2_in_parallel() {
+    bounded(async {
+        let mut tasks = JoinSet::new();
+        for authority in [
+            "example.test",
+            "EXAMPLE.TEST:80",
+            "127.0.0.1:8080",
+            "[::1]:443",
+            "[2001:db8::1]",
+            "[::ffff:192.0.2.1]:80",
+            "[v1.name:part]:80",
+            "example.test:",
+            "name_~!$&'()*+,;=",
+        ] {
+            tasks.spawn(async move {
+                request_round_trip(
+                    "GET",
+                    "/",
+                    authority,
+                    authority,
+                    &[("host", "other.test")],
+                    b"",
+                    false,
+                )
+                .await;
+            });
+        }
+        tasks.spawn(request_round_trip(
+            "GET",
+            "/",
+            "",
+            "fallback.test:8080",
+            &[("host", "fallback.test:8080")],
+            b"",
+            false,
+        ));
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await;
+}
+
+#[test]
+fn authority_syntax_preserves_percent_encoding_and_custom_schemes() {
+    // The reference peer's http::Uri rejects percent-encoded registered names.
+    // RFC 3986 allows them; use independent HPACK decoding to check the wire.
+    for (method, authority, scheme) in [
+        ("GET", "caf%C3%A9.test", "https"),
+        ("GET", "user:pass@example.test:22", "git+ssh"),
+        ("GET", "user%40name@[::1]:22", "git+ssh"),
+        ("GET", "", "custom"),
+        ("CONNECT", "[::1]:443", ""),
+        ("CONNECT", "example.test:65535", ""),
+    ] {
+        let mut connection = Connection::new();
+        let mut out = [0; 256];
+        let (_, len) = connection
+            .request(method, "/", authority, scheme, &[], b"", &mut out)
+            .unwrap();
+        let decoded = fluke_hpack::Decoder::new()
+            .decode(&out[frame::HEADER_LEN..len])
+            .unwrap();
+        let authorities: Vec<_> = decoded
+            .iter()
+            .filter(|(name, _)| name == b":authority")
+            .map(|(_, value)| value.as_slice())
+            .collect();
+        if authority.is_empty() {
+            assert!(authorities.is_empty());
+        } else {
+            assert_eq!(authorities, [authority.as_bytes()]);
+        }
+    }
 }

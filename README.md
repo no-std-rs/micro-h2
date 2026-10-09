@@ -70,9 +70,12 @@ Late frames on closed streams produce no application events, while preserving
 connection flow control and HPACK state. DATA after a successful CONNECT carries
 tunnel bytes and ignores response Content-Length.
 Outgoing fields and declared body lengths are checked before opening a stream
-or writing output; schemes and paths must follow URI grammar (including OPTIONS
-`*` and percent escapes), and consistent duplicate Content-Length values are
-emitted once.
+or writing output; schemes, authorities, and paths must follow URI grammar
+(including IPv6 literals, OPTIONS `*`, and percent escapes), and consistent
+duplicate Content-Length values are emitted once. The authority argument supplies
+the request's routing identity; redundant `host` fields are omitted. If that
+argument is empty, a single `host` field supplies `:authority`. HTTP(S) requires
+a nonempty host, and CONNECT requires a host and explicit TCP port.
 
 Transport adapters that consume DATA incrementally can call `finish_data` for
 unpadded frames. Padded frames require `finish_data_with_length`, supplying the
