@@ -6,6 +6,13 @@ pub(crate) fn token(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
+pub(crate) fn scheme_valid(scheme: &str) -> bool {
+    // RFC 3986 section 3.1: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
+    let mut bytes = scheme.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"+-.".contains(&byte))
+}
+
 pub(crate) fn value_valid(value: &str) -> bool {
     !value
         .bytes()

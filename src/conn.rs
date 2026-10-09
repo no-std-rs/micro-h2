@@ -196,9 +196,8 @@ impl Connection {
             || (method == "CONNECT" && authority.is_empty())
             || (method != "CONNECT"
                 && (path.is_empty()
-                    || scheme.is_empty()
                     || !headers::value_valid(path)
-                    || !headers::value_valid(scheme)))
+                    || !headers::scheme_valid(scheme)))
         {
             return Err(Error::Protocol);
         }

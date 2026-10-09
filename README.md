@@ -69,7 +69,8 @@ Late frames on closed streams produce no application events, while preserving
 connection flow control and HPACK state. DATA after a successful CONNECT carries
 tunnel bytes and ignores response Content-Length.
 Outgoing fields and declared body lengths are checked before opening a stream
-or writing output; consistent duplicate Content-Length values are emitted once.
+or writing output; schemes must follow URI scheme grammar, and consistent
+duplicate Content-Length values are emitted once.
 
 Transport adapters that consume DATA incrementally can call `finish_data` for
 unpadded frames. Padded frames require `finish_data_with_length`, supplying the

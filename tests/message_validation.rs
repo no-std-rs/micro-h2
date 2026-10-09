@@ -424,6 +424,49 @@ fn invalid_requests_leave_stream_slots_identifiers_and_output_untouched() {
 }
 
 #[test]
+fn invalid_schemes_leave_request_state_and_output_untouched() {
+    for scheme in [
+        "", "ht tp", "1http", "https://", "h_ttp", "http/", "üttps", "+http", "http\tx",
+    ] {
+        let mut connection = Connection::new();
+        let mut out = [0xaa; 256];
+        for _ in 0..8 {
+            assert_eq!(
+                connection.request("GET", "/", "example.test", scheme, &[], b"", &mut out),
+                Err(Error::Protocol),
+                "{scheme:?}"
+            );
+            assert_eq!(out, [0xaa; 256]);
+            assert_eq!(connection.open_streams(), 0);
+        }
+        assert_eq!(
+            connection
+                .request("GET", "/", "example.test", "https", &[], b"", &mut out)
+                .unwrap()
+                .0,
+            1
+        );
+    }
+    for scheme in ["http", "HTTPS", "git+ssh", "x.y", "x-y", "h2", "a"] {
+        let mut connection = Connection::new();
+        let mut out = [0; 256];
+        let (stream, len) = connection
+            .request("GET", "/", "example.test", scheme, &[], b"", &mut out)
+            .unwrap();
+        assert_eq!(stream, 1);
+        let mut emitted = None;
+        micro_h2::hpack::Decoder::new(256)
+            .decode(&out[frame::HEADER_LEN..len], |name, value| {
+                if name == ":scheme" {
+                    emitted = Some(value.to_owned());
+                }
+            })
+            .unwrap();
+        assert_eq!(emitted.as_deref(), Some(scheme));
+    }
+}
+
+#[test]
 fn duplicate_lengths_and_connect_pseudo_headers_are_unambiguous() {
     let mut connection = connection("GET");
     connection
