@@ -13,11 +13,19 @@ static CALLS: AtomicUsize = AtomicUsize::new(0);
 static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 fn reserve(bytes: usize) -> bool {
-    LIVE.fetch_update(Relaxed, Relaxed, |live| {
-        live.checked_add(bytes)
+    let mut live = LIVE.load(Relaxed);
+    loop {
+        let Some(next) = live
+            .checked_add(bytes)
             .filter(|next| *next <= LIMIT.load(Relaxed))
-    })
-    .is_ok()
+        else {
+            return false;
+        };
+        match LIVE.compare_exchange_weak(live, next, Relaxed, Relaxed) {
+            Ok(_) => return true,
+            Err(current) => live = current,
+        }
+    }
 }
 
 fn allocated() {

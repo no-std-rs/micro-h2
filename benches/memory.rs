@@ -117,7 +117,10 @@ impl<const RX: usize, const SINK: usize> Workspace<RX, SINK> {
         let header = FrameHeader::parse(&self.output[settings_start..]).unwrap();
         assert_eq!(header.kind, FrameType::Settings);
         let settings_end = settings_start + HEADER_LEN + header.length;
-        for setting in self.output[settings_start + HEADER_LEN..settings_end].chunks_exact(6) {
+        for setting in self.output[settings_start + HEADER_LEN..settings_end]
+            .as_chunks::<6>()
+            .0
+        {
             let id = u16::from_be_bytes(setting[..2].try_into().unwrap());
             let value = u32::from_be_bytes(setting[2..].try_into().unwrap());
             if id == settings::INITIAL_WINDOW_SIZE {
