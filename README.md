@@ -1,5 +1,7 @@
 # micro-h2
 
+[![Runnerless CI: slowest job](https://badges.runnerlesshq.com/github.com/no-std-rs/micro-h2/badge.svg)](https://app.runnerlesshq.com)
+
 [![CI](https://github.com/no-std-rs/micro-h2/actions/workflows/ci.yml/badge.svg)](https://github.com/no-std-rs/micro-h2/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/micro-h2.svg)](https://crates.io/crates/micro-h2)
 [![docs.rs](https://docs.rs/micro-h2/badge.svg)](https://docs.rs/micro-h2)
