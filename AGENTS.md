@@ -18,6 +18,8 @@ Keep Cargo.lock committed so CI and dependency updates are reproducible.
 PR titles must use Conventional Commits because squash merges use the PR title
 as the commit message. Prefer scope `micro-h2` and a lowercase imperative
 subject, for example `fix(micro-h2): reject an invalid stream identifier`.
+Runnerless-generated release PRs use `chore(main): release micro-h2 <version>`;
+the title check accepts the default-branch scope `main` for these releases.
 
 Use `feat`, `fix`, or `perf` for changes that should trigger a release;
 `refactor`, `docs`, `test`, `ci`, `build`, and `chore` do not trigger one.

@@ -32,6 +32,8 @@ jobs:
             chore
           scopes: |
             micro-h2
+            main
+          # Runnerless uses chore(main) for release PRs targeting main.
           requireScope: false
           subjectPattern: ^(?![A-Z]).+$
           subjectPatternError: |

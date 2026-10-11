@@ -6,6 +6,8 @@
 ### ⚠ BREAKING CHANGES
 
 * completing padded streamed DATA now requires
+  `finish_data_with_length` with the unpadded content length. Invalid HTTP
+  messages and unsupported trailers are rejected before delivery.
 
 ### Bug Fixes
 
